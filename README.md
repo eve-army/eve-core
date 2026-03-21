@@ -40,6 +40,15 @@ npm start
 
 Typecheck only (no bundler): `npx tsc --noEmit`
 
+## Production (VPS + LiveKit RTMP)
+
+To run on a VPS (e.g. **78.46.210.25**) with **nginx**, **Let’s Encrypt**, **systemd**, and a **24/7 ffmpeg** publisher to pump.fun’s **LiveKit RTMP ingress**, follow **[deploy/VPS-SETUP.md](deploy/VPS-SETUP.md)**. It includes:
+
+- `deploy/systemd/*.service` — `eve-core` (Next.js) and `eve-livekit-rtmp` (ffmpeg)
+- `deploy/nginx-eve-core.conf` — reverse proxy with long timeouts for SSE (`/api/pumpchat`)
+- `deploy/scripts/livekit-publish.sh` — RTMP publish (test pattern, looped file, or black/silent)
+- `deploy/app.env.example` / `deploy/rtmp.env.example` — templates for `/etc/eve-core/*.env` (never commit secrets)
+
 ### If you see `Bus error (core dumped)` when running Next
 
 On some Linux setups, Node loads the **wrong** `@next/swc` binary (for example **musl** inside `next/node_modules` on a **glibc** distro). Loading that `.node` file can crash the process with a bus error before any JS runs.
