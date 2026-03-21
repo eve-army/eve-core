@@ -99,7 +99,7 @@ ffmpeg -protocols 2>&1 | grep -E 'tls|rtmp'
    ```
    systemd loads this file via `EnvironmentFile`; Next also picks compatible vars from the environment.
 
-   For **browser RTMP** (§5), set `NEXT_PUBLIC_EVE_DEFAULT_ROOM`, `NEXT_PUBLIC_EVE_AUTO_CONNECT=1`, and optional `NEXT_PUBLIC_EVE_KIOSK=1` here, then **rebuild** (`npm run build`) before enabling `eve-browser-rtmp`.
+   For **browser RTMP** (§5), set **`EVE_*`** in `app.env` (room, auto-connect, ticker, kiosk) — **no rebuild** after changing those; restart **`eve-core`** only. Requires a deploy that includes runtime `/eve` config (see §5.1).
 
 4. **systemd — eve-core**
    ```bash
@@ -165,26 +165,30 @@ Use this **or** §5 **Browser RTMP capture** below — **not both** on the same 
 
 ## 5. Browser RTMP capture (`/eve` → pump)
 
-Streams the **same UI as** `https://your-domain/eve` (voice agent, visualizer, TTS audio) by running **Chromium on a virtual display** and encoding with **ffmpeg** to your existing RTMP ingest. Requires a **production build** that knows the pump room without manual paste.
+Streams the **same UI as** `https://your-domain/eve` (voice agent, visualizer, TTS audio) by running **Chromium on a virtual display** and encoding with **ffmpeg** to your existing RTMP ingest.
 
-### 5.1 App env (`/etc/eve-core/app.env`) and rebuild
+### 5.1 App env (`/etc/eve-core/app.env`) — room, chat, ticker
 
-`NEXT_PUBLIC_*` variables are **baked at `npm run build`**. After changing them:
-
-```bash
-cd /opt/eve-core
-sudo -u eve npm run build
-sudo systemctl restart eve-core
-```
-
-Set (see [app.env.example](./app.env.example)):
+**Prefer `EVE_*`** (read when `/eve` is rendered; **restart `eve-core`** after edits — **no `npm run build`**):
 
 | Variable | Purpose |
 |----------|---------|
-| `NEXT_PUBLIC_EVE_DEFAULT_ROOM` | Mint or full `https://pump.fun/coin/...` URL |
-| `NEXT_PUBLIC_EVE_AUTO_CONNECT=1` | Start SSE / agent loop on load (no **Start Agent** click) |
-| `NEXT_PUBLIC_EVE_STREAM_USERNAME` | Optional chat display name for `/api/pumpchat` |
-| `NEXT_PUBLIC_EVE_KIOSK=1` | Hide token URL fields (cleaner video frame) |
+| `EVE_DEFAULT_ROOM` | Mint or full `https://pump.fun/coin/...` URL (pump live chat room) |
+| `EVE_AUTO_CONNECT=1` | Connect SSE / start agent on load (no **Start Agent** click) |
+| `EVE_STREAM_USERNAME` | Optional display name for `/api/pumpchat` |
+| `EVE_STREAM_NAME` | Token name on the stream overlay |
+| `EVE_STREAM_TICKER` | Ticker symbol on the overlay (e.g. `PUMP`) |
+| `EVE_KIOSK=1` | Hide token URL row (cleaner RTMP frame) |
+
+**`NEXT_PUBLIC_EVE_*`** still work as **build-time** fallbacks; if you use only those, change → `npm run build` → restart `eve-core`.
+
+```bash
+sudo nano /etc/eve-core/app.env
+sudo systemctl restart eve-core
+sudo systemctl restart eve-browser-rtmp   # reload Chromium to fresh HTML
+```
+
+Do **not** put room or RTMP secrets in `rtmp.env` — that file is only for ffmpeg; Next.js reads **`app.env`** via `eve-core.service`.
 
 ### 5.2 Packages (Ubuntu 24.04)
 
@@ -227,7 +231,7 @@ The unit creates `/run/user/<eve-uid>` for Pulse; alternatively enable lingering
 | No audio on stream | `pactl list short sinks` includes `eve_stream_sink`; Chromium must use default sink (`PULSE_SINK` is set in the script) |
 | **Broken pipe** / TLS errors | Same as §4 — one publisher per key; key rotated; network |
 | High CPU | Lower `VIDEO_SIZE` (e.g. `854x480`), `VIDEO_FPS=24`, `VIDEO_BITRATE`; prefer ElevenLabs over HF TTS for latency |
-| Autoplay blocked | Keep `--autoplay-policy=no-user-gesture-required` in [eve-browser-rtmp.sh](./scripts/eve-browser-rtmp.sh); confirm `NEXT_PUBLIC_EVE_AUTO_CONNECT=1` and rebuild |
+| Autoplay blocked | Keep `--autoplay-policy=no-user-gesture-required` in [eve-browser-rtmp.sh](./scripts/eve-browser-rtmp.sh); set `EVE_AUTO_CONNECT=1` (or `NEXT_PUBLIC_…` + rebuild) |
 
 ---
 
@@ -255,7 +259,7 @@ sudo -u eve npm run build    # add NEXT_TEST_WASM=1 if required
 sudo systemctl restart eve-core
 ```
 
-RTMP services are independent of app deploy; restart **`eve-livekit-rtmp`** or **`eve-browser-rtmp`** if you change `rtmp.env` or capture scripts. After changing **`NEXT_PUBLIC_*`** in `app.env`, rebuild Next and restart **`eve-core`**; restart **`eve-browser-rtmp`** so Chromium loads the new bundle.
+RTMP services are independent of app deploy; restart **`eve-livekit-rtmp`** or **`eve-browser-rtmp`** if you change `rtmp.env` or capture scripts. After changing **`EVE_*`** in `app.env`, restart **`eve-core`** and **`eve-browser-rtmp`** (no rebuild). After changing **`NEXT_PUBLIC_*`**, rebuild Next, restart **`eve-core`**, then **`eve-browser-rtmp`**.
 
 ---
 
