@@ -1,0 +1,22 @@
+[Unit]
+Description=eve-core browser RTMP capture (Xvfb + Chromium + ffmpeg)
+Documentation=file:///opt/eve-core/deploy/VPS-SETUP.md
+After=network-online.target eve-core.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eve
+Group=eve
+SupplementaryGroups=audio
+EnvironmentFile=-/etc/eve-core/rtmp.env
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+# Pulse needs a writable user runtime dir (alternatively: sudo loginctl enable-linger eve)
+ExecStartPre=+/bin/sh -c 'install -d -m 0700 -o eve -g eve /run/user/$(id -u eve)'
+ExecStart=/opt/eve-core/deploy/scripts/eve-browser-rtmp.sh
+Restart=always
+RestartSec=15
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

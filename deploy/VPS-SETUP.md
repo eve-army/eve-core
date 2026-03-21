@@ -99,6 +99,8 @@ ffmpeg -protocols 2>&1 | grep -E 'tls|rtmp'
    ```
    systemd loads this file via `EnvironmentFile`; Next also picks compatible vars from the environment.
 
+   For **browser RTMP** (§5), set `NEXT_PUBLIC_EVE_DEFAULT_ROOM`, `NEXT_PUBLIC_EVE_AUTO_CONNECT=1`, and optional `NEXT_PUBLIC_EVE_KIOSK=1` here, then **rebuild** (`npm run build`) before enabling `eve-browser-rtmp`.
+
 4. **systemd — eve-core**
    ```bash
    sudo cp /opt/eve-core/deploy/systemd/eve-core.service /etc/systemd/system/
@@ -125,6 +127,8 @@ ffmpeg -protocols 2>&1 | grep -E 'tls|rtmp'
 ---
 
 ## 4. LiveKit RTMP publisher (todo: ffmpeg-rtmp)
+
+Use this **or** §5 **Browser RTMP capture** below — **not both** on the same stream key (only one RTMP publisher).
 
 1. **Confirm RTMP ingest URL** in pump.fun / LiveKit (path varies). Set **one** of:
    - `RTMP_URL=rtmps://...full...`
@@ -159,7 +163,74 @@ ffmpeg -protocols 2>&1 | grep -E 'tls|rtmp'
 
 ---
 
-## 5. Verification & ops (todo: ops-verify)
+## 5. Browser RTMP capture (`/eve` → pump)
+
+Streams the **same UI as** `https://your-domain/eve` (voice agent, visualizer, TTS audio) by running **Chromium on a virtual display** and encoding with **ffmpeg** to your existing RTMP ingest. Requires a **production build** that knows the pump room without manual paste.
+
+### 5.1 App env (`/etc/eve-core/app.env`) and rebuild
+
+`NEXT_PUBLIC_*` variables are **baked at `npm run build`**. After changing them:
+
+```bash
+cd /opt/eve-core
+sudo -u eve npm run build
+sudo systemctl restart eve-core
+```
+
+Set (see [app.env.example](./app.env.example)):
+
+| Variable | Purpose |
+|----------|---------|
+| `NEXT_PUBLIC_EVE_DEFAULT_ROOM` | Mint or full `https://pump.fun/coin/...` URL |
+| `NEXT_PUBLIC_EVE_AUTO_CONNECT=1` | Start SSE / agent loop on load (no **Start Agent** click) |
+| `NEXT_PUBLIC_EVE_STREAM_USERNAME` | Optional chat display name for `/api/pumpchat` |
+| `NEXT_PUBLIC_EVE_KIOSK=1` | Hide token URL fields (cleaner video frame) |
+
+### 5.2 Packages (Ubuntu 24.04)
+
+```bash
+sudo apt install -y xvfb pulseaudio chromium-browser ffmpeg curl
+# optional: xdotool — fallback keypress if auto-connect fails
+sudo apt install -y xdotool
+```
+
+If you use **PipeWire** instead of PulseAudio, ensure **`pipewire-pulse`** provides `pactl` and a session socket for user `eve`.
+
+### 5.3 Disable the test-pattern publisher
+
+Only one process may publish to the same RTMP URL:
+
+```bash
+sudo systemctl disable --now eve-livekit-rtmp
+```
+
+### 5.4 Script + systemd
+
+`rtmp.env` is the same file as §4 (`RTMP_URL` or `RTMP_BASE` + `RTMP_STREAM_KEY`). Optional: `EVE_INTERNAL_URL`, `VIDEO_SIZE`, `VIDEO_FPS`, `VIDEO_BITRATE` (see [rtmp.env.example](./rtmp.env.example)).
+
+```bash
+sudo chmod +x /opt/eve-core/deploy/scripts/eve-browser-rtmp.sh
+sudo cp /opt/eve-core/deploy/systemd/eve-browser-rtmp.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now eve-browser-rtmp
+journalctl -u eve-browser-rtmp -f
+```
+
+The unit creates `/run/user/<eve-uid>` for Pulse; alternatively enable lingering: `sudo loginctl enable-linger eve`.
+
+### 5.5 Chromium / audio / TLS troubleshooting
+
+| Symptom | What to check |
+|--------|----------------|
+| Black video | `DISPLAY=:99`; Xvfb running; wait longer before ffmpeg; try non-kiosk window size |
+| No audio on stream | `pactl list short sinks` includes `eve_stream_sink`; Chromium must use default sink (`PULSE_SINK` is set in the script) |
+| **Broken pipe** / TLS errors | Same as §4 — one publisher per key; key rotated; network |
+| High CPU | Lower `VIDEO_SIZE` (e.g. `854x480`), `VIDEO_FPS=24`, `VIDEO_BITRATE`; prefer ElevenLabs over HF TTS for latency |
+| Autoplay blocked | Keep `--autoplay-policy=no-user-gesture-required` in [eve-browser-rtmp.sh](./scripts/eve-browser-rtmp.sh); confirm `NEXT_PUBLIC_EVE_AUTO_CONNECT=1` and rebuild |
+
+---
+
+## 6. Verification & ops (todo: ops-verify)
 
 | Check | Command / action |
 |--------|-------------------|
@@ -167,12 +238,13 @@ ffmpeg -protocols 2>&1 | grep -E 'tls|rtmp'
 | EVE UI | Browser: `https://live.eve.army/eve` or `/pumpfun` redirect |
 | SSE / chat | Connect a mint; `/api/pumpchat` should stay open (nginx timeouts raised) |
 | RTMP | pump.fun / LiveKit viewer shows the ffmpeg feed |
-| Survive reboot | `sudo reboot` then `systemctl is-active eve-core eve-livekit-rtmp` |
-| Logs | `journalctl -u eve-core -u eve-livekit-rtmp --since today` |
+| Browser RTMP | After §5: viewer shows **EVE** UI + TTS; `systemctl is-active eve-browser-rtmp` |
+| Survive reboot | `sudo reboot` then `systemctl is-active eve-core` and the enabled RTMP unit (`eve-livekit-rtmp` **or** `eve-browser-rtmp`) |
+| Logs | `journalctl -u eve-core -u eve-livekit-rtmp -u eve-browser-rtmp --since today` |
 
 ---
 
-## 6. Updating the app
+## 7. Updating the app
 
 ```bash
 cd /opt/eve-core
@@ -182,7 +254,7 @@ sudo -u eve npm run build    # add NEXT_TEST_WASM=1 if required
 sudo systemctl restart eve-core
 ```
 
-ffmpeg service is independent; restart only if you change `rtmp.env` or the script.
+RTMP services are independent of app deploy; restart **`eve-livekit-rtmp`** or **`eve-browser-rtmp`** if you change `rtmp.env` or capture scripts. After changing **`NEXT_PUBLIC_*`** in `app.env`, rebuild Next and restart **`eve-core`**; restart **`eve-browser-rtmp`** so Chromium loads the new bundle.
 
 ---
 
@@ -195,5 +267,7 @@ ffmpeg service is independent; restart only if you change `rtmp.env` or the scri
 | [rtmp.env.example](./rtmp.env.example) | Template for `/etc/eve-core/rtmp.env` |
 | [nginx-eve-core.conf](./nginx-eve-core.conf) | Reverse proxy + SSE-friendly timeouts |
 | [systemd/eve-core.service](./systemd/eve-core.service) | Next.js service |
-| [systemd/eve-livekit-rtmp.service](./systemd/eve-livekit-rtmp.service) | ffmpeg publisher |
+| [systemd/eve-livekit-rtmp.service](./systemd/eve-livekit-rtmp.service) | ffmpeg test-pattern publisher |
+| [systemd/eve-browser-rtmp.service](./systemd/eve-browser-rtmp.service) | Xvfb + Chromium + ffmpeg → RTMP |
 | [scripts/livekit-publish.sh](./scripts/livekit-publish.sh) | ffmpeg command (lavfi / loop / black) |
+| [scripts/eve-browser-rtmp.sh](./scripts/eve-browser-rtmp.sh) | Browser capture → RTMP |

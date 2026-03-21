@@ -429,9 +429,16 @@ function BondingCurveVisualizer({
   );
 }
 
+const isEveKiosk =
+  typeof process !== "undefined" && process.env.NEXT_PUBLIC_EVE_KIOSK === "1";
+
 export default function PumpfunChatPage() {
-  const [addressInput, setAddressInput] = useState("");
-  const [username, setUsername] = useState("");
+  const [addressInput, setAddressInput] = useState(() =>
+    (process.env.NEXT_PUBLIC_EVE_DEFAULT_ROOM ?? "").trim()
+  );
+  const [username, setUsername] = useState(() =>
+    (process.env.NEXT_PUBLIC_EVE_STREAM_USERNAME ?? "").trim()
+  );
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [messages, setMessages] = useState<IMessage[]>([]);
@@ -494,6 +501,7 @@ export default function PumpfunChatPage() {
   const clientRef = useRef<EventSource | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const autoConnectRanRef = useRef(false);
   
   // Auto-fetch HF Voice Models on load
   useEffect(() => {
@@ -1064,6 +1072,19 @@ export default function PumpfunChatPage() {
     }
   };
 
+  // VPS / headless Chromium: connect without clicking Start (requires browser autoplay flags).
+  useEffect(() => {
+    if (process.env.NEXT_PUBLIC_EVE_AUTO_CONNECT !== "1") return;
+    if (autoConnectRanRef.current) return;
+    if (!addressInput.trim()) return;
+    autoConnectRanRef.current = true;
+    const t = window.setTimeout(() => {
+      void handleConnect(false);
+    }, 750);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- run once when default room is present; handleConnect stable enough for initial connect
+  }, [addressInput]);
+
   const handleDisconnect = () => {
     if (clientRef.current) {
       clientRef.current.close();
@@ -1168,6 +1189,7 @@ export default function PumpfunChatPage() {
               <Volume2 className="w-4 h-4" />
             </button>
           </div>
+          {!isEveKiosk && (
           <div className="relative hidden sm:block w-48 lg:w-64">
             <LinkIcon className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500 pointer-events-none" />
             <input
@@ -1179,6 +1201,7 @@ export default function PumpfunChatPage() {
               className="w-full bg-white/5 border border-white/10 rounded-lg py-2 pl-9 pr-3 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500/60 focus:border-cyan-500/50 transition-all disabled:opacity-50 placeholder:text-gray-500"
             />
           </div>
+          )}
           {!isConnected ? (
             <button
               onClick={() => handleConnect(false)}
@@ -1208,6 +1231,7 @@ export default function PumpfunChatPage() {
       </header>
 
       {/* Mobile: token input + error below header */}
+      {!isEveKiosk && (
       <div className="sm:hidden relative z-10 px-4 py-2 space-y-2">
         <div className="relative">
           <LinkIcon className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500" />
@@ -1227,8 +1251,9 @@ export default function PumpfunChatPage() {
           </div>
         )}
       </div>
+      )}
       {error && (
-        <div className="hidden sm:block relative z-10 px-6 py-2">
+        <div className={`relative z-10 px-6 py-2 ${isEveKiosk ? "" : "hidden sm:block"}`}>
           <div className="p-2.5 bg-cyan-500/10 border border-cyan-500/20 rounded-lg text-cyan-400 text-sm flex items-start gap-2 max-w-2xl">
             <span>•</span>
             <span>{error}</span>
