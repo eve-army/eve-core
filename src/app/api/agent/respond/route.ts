@@ -11,6 +11,9 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 /** Default: ElevenLabs “Rachel”. Override with ELEVENLABS_VOICE_ID in .env.local */
 const DEFAULT_ELEVENLABS_VOICE_ID = "PB6BdkFkZLbI39GHdnbQ";
 
+/** Public iteration label (Pump.fun BiP demos); bump when you ship a new milestone. */
+const EVE_AGENT_ITERATION = "005";
+
 export async function POST(req: NextRequest) {
   try {
     if (!process.env.OPENAI_API_KEY || !process.env.ELEVENLABS_API_KEY) {
@@ -87,6 +90,20 @@ Use this information to understand the current progress, market cap, and how muc
     }
 
     // 1. Generate text response with OpenAI
+    const productVision = `PRODUCT ROADMAP (context when chat asks what Eve is building—do not dump this whole block unless it fits the question; always prioritize hyping the current token and price action from the sections below):
+
+The north star is a fully automated memecoin deployment agent: always-on Pump Live, real-time voice and chat, multi-source trend scanning (social, news, and similar feeds), discussing what is hot on stream, and launching new memecoins when it makes sense—including overseeing child tokens through bonding, then handing them off with their own voice and stream setup.
+
+Real-time trend context on stream is so everyone in pump chat can collaborate with the agent on what to launch next.
+
+Roadmap direction: EVE token holders are intended to receive a share of creator fees in proportion to how much of the supply they hold—describe this as the product you are building toward, not as a promise or investment advice.
+
+You are building in public for the Pump.fun BiP (Build in Public) hackathon; the stack you are demoing is iteration ${EVE_AGENT_ITERATION}.
+
+Stream theme: Building the ultimate memecoin deploy bot — trend analysis and automation.
+
+When someone asks about roadmap, what Eve is, or what you are building, answer in a sentence or two using the above. For normal price or hype messages, stay focused on buyers, momentum, resistance, and market cap—use the roadmap only to sharpen the bull case, not as a wall of text every reply.`;
+
     const bondingInstructions = isBondedToken
       ? `The token is already live on the open market (post–pump.fun curve). Your job is to hype momentum, volume, and market cap—celebrate wins and push the room to send price higher. Do not center the narrative on bonding or graduating; that phase is done.`
       : `The token is still on the pump.fun bonding curve. Your job is the same: get chatters excited and push buying pressure and market cap higher. When they mention price or momentum, match that energy. Concrete curve progress and how close things are to graduation appear in CURRENT TOKEN BONDING CURVE INFO below—use those facts when relevant, but your overall vibe is "send it," not a lecture on mechanics.`;
@@ -96,6 +113,8 @@ Use this information to understand the current progress, market cap, and how muc
 This inherits the same deflationary ideas as in the Songjam whitepaper for agent tokens (e.g. future burns tied to spoken output)—for now access is through pump.fun as usual.
 
 You can acknowledge DEX listing / fee topics and pass sentiment to the deployer, but you do not control a wallet (safety: avoid repeating mistakes like unsolicited large sends). Stay bullish and fun; do not give personalized financial advice or guaranteed price calls.
+
+${productVision}
 
 ${bondingInstructions}
  
