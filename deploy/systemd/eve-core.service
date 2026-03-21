@@ -1,0 +1,24 @@
+[Unit]
+Description=eve-core Next.js (EVE / pump.fun UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eve
+Group=eve
+WorkingDirectory=/opt/eve-core
+Environment=NODE_ENV=production
+# Optional: NEXT_TEST_WASM=1 if `next build` / native SWC crashes on this host (see VPS-SETUP.md)
+EnvironmentFile=-/etc/eve-core/app.env
+
+# Use the same Node you used for `npm run build` (adjust path: `which node`)
+ExecStart=/usr/bin/node /opt/eve-core/node_modules/next/dist/bin/next start -H 127.0.0.1 -p 3000
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

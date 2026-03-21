@@ -1,0 +1,23 @@
+[Unit]
+Description=eve-core LiveKit RTMP publisher (ffmpeg)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eve
+Group=eve
+EnvironmentFile=-/etc/eve-core/rtmp.env
+# Path matches clone location /opt/eve-core; change if you deploy elsewhere
+ExecStart=/opt/eve-core/deploy/scripts/livekit-publish.sh
+Restart=always
+RestartSec=5
+
+# ffmpeg can be CPU-heavy; raise if you see OOM kills
+# MemoryMax=2G
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
