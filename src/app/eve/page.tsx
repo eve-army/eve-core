@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { IMessage } from '@/lib/pumpChatClient';
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -652,23 +652,85 @@ export default function PumpfunChatPage() {
              }
              
              if (isBonded) {
-               // Token has bonded or doesn't have pump curve data, fetch from DexScreener
+               // Prefer Moralis (server uses MORALIS_API_KEY) for fresher MC; DexScreener as fallback.
+               let moralisOk = false;
                try {
-                 const dexRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${currentTokenAddress}`);
-                 if (dexRes.ok) {
-                   const dexData = await dexRes.json();
-                   if (dexData.pairs && dexData.pairs.length > 0) {
-                     // Raydium pair for memecoins is usually first
-                     const pair = dexData.pairs.find((p: any) => p.dexId === 'raydium') || dexData.pairs[0];
-                     if (pair && pair.priceNative) {
-                       mcSol = parseFloat(pair.priceNative) * 1_000_000_000;
-                     }
-                   }
+                 const mRes = await fetch(
+                   `/api/token/metrics?mint=${encodeURIComponent(currentTokenAddress)}`,
+                 );
+                 const mJson = (await mRes.json()) as {
+                   ok?: boolean;
+                   mcSol?: number;
+                 };
+                 if (mJson.ok && typeof mJson.mcSol === "number" && mJson.mcSol > 0) {
+                   mcSol = mJson.mcSol;
+                   moralisOk = true;
                  }
                } catch (e) {
-                 console.error("Dexscreener fetch error:", e);
+                 console.warn("Moralis token metrics fetch failed:", e);
+               }
+
+               if (!moralisOk) {
+                 try {
+                   const dexRes = await fetch(
+                     `https://api.dexscreener.com/latest/dex/tokens/${currentTokenAddress}`,
+                   );
+                   if (dexRes.ok) {
+                     const dexData = await dexRes.json();
+                     if (dexData.pairs && dexData.pairs.length > 0) {
+                       const pair =
+                         dexData.pairs.find((p: { dexId?: string }) => p.dexId === "raydium") ||
+                         dexData.pairs[0];
+                       const solUsd = stateRefs.current.solUsdPrice;
+                       const num = (v: unknown) =>
+                         typeof v === "number" && Number.isFinite(v)
+                           ? v
+                           : typeof v === "string"
+                             ? parseFloat(v)
+                             : NaN;
+                       const mcapUsd = num(pair.marketCap);
+                       const fdvUsd = num(pair.fdv);
+                       const usdVal =
+                         Number.isFinite(mcapUsd) && mcapUsd > 0
+                           ? mcapUsd
+                           : Number.isFinite(fdvUsd) && fdvUsd > 0
+                             ? fdvUsd
+                             : null;
+                       if (usdVal != null && solUsd != null && solUsd > 0) {
+                         mcSol = usdVal / solUsd;
+                       } else if (solUsd != null && solUsd > 0 && pair.priceUsd) {
+                         const pUsd = num(pair.priceUsd);
+                         if (Number.isFinite(pUsd) && pUsd > 0) {
+                           const pSol = pUsd / solUsd;
+                           const typicalPumpSupply = 1e9;
+                           mcSol = pSol * typicalPumpSupply;
+                         }
+                       }
+                     }
+                   }
+                 } catch (e) {
+                   console.error("Dexscreener fetch error:", e);
+                 }
                }
                setIsBondedToken(true);
+             }
+
+             // Pre-bond: if on-chain MC is missing, try Moralis (same key as OHLCV).
+             if (!isBonded && mcSol <= 0) {
+               try {
+                 const mRes = await fetch(
+                   `/api/token/metrics?mint=${encodeURIComponent(currentTokenAddress)}`,
+                 );
+                 const mJson = (await mRes.json()) as {
+                   ok?: boolean;
+                   mcSol?: number;
+                 };
+                 if (mJson.ok && typeof mJson.mcSol === "number" && mJson.mcSol > 0) {
+                   mcSol = mJson.mcSol;
+                 }
+               } catch {
+                 /* ignore */
+               }
              }
 
              if (mcSol > 0) {
@@ -1026,6 +1088,20 @@ export default function PumpfunChatPage() {
     // messageStatuses and aiReplies intentionally kept to persist data
   };
 
+  /** Tight Y scale so small MC moves are visible (avoids a flat line when values barely change). */
+  const mcChartYDomain = useMemo((): [number, number] | undefined => {
+    if (priceHistory.length < 2) return undefined;
+    const vals = priceHistory.map((p) => p.mcSol);
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const span = max - min;
+    const pad =
+      span > 1e-12
+        ? Math.max(span * 0.2, max * 0.003)
+        : Math.max(Math.abs(max) * 0.025, 1e-6);
+    return [min - pad, max + pad];
+  }, [priceHistory]);
+
   return (
     <div className="h-screen bg-[#050508] text-white flex flex-col font-sans selection:bg-cyan-500/30 overflow-hidden">
       {/* Full-bleed background */}
@@ -1200,7 +1276,10 @@ export default function PumpfunChatPage() {
                       <stop offset="95%" stopColor="#00f5ff" stopOpacity={0} />
                     </linearGradient>
                   </defs>
-                  <YAxis domain={['auto', 'auto']} hide />
+                  <YAxis
+                    domain={mcChartYDomain ?? ["auto", "auto"]}
+                    hide
+                  />
                   <Tooltip
                     contentStyle={{ background: 'rgba(0,0,0,0.7)', border: '1px solid #00f5ff33', borderRadius: 4, fontSize: 10, padding: '2px 6px' }}
                     itemStyle={{ color: '#00f5ff' }}

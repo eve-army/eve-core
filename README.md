@@ -26,7 +26,7 @@ Open [http://localhost:3000/pumpfun](http://localhost:3000/pumpfun) (redirects t
 | `OPENAI_API_KEY` | For AI replies | `/api/agent/respond` |
 | `ELEVENLABS_API_KEY` | For default voice | Same route (ElevenLabs TTS) |
 | `ELEVENLABS_VOICE_ID` | Optional | Which ElevenLabs voice to use; defaults to Rachel |
-| `MORALIS_API_KEY` | Optional | Bonded-token OHLCV via `/api/agent/moralis` |
+| `MORALIS_API_KEY` | Optional | Bonded-token OHLCV (`/api/agent/moralis`) and **live MC** for the chart (`/api/token/metrics`, preferred over DexScreener when set) |
 | `NEXT_PUBLIC_RPC_URL` | Optional | Solana RPC; falls back to public mainnet |
 
 Hugging Face TTS (non-default voices) uses the public Space `AdamSongjam/ultimate-rvc` from the browser via `@gradio/client`.
