@@ -125,9 +125,32 @@ PIDS+=("$!")
 
 sleep 4
 
-# Optional: focus window and send Enter (if auto-connect did not run)
+# Optional: focus window and send Enter (if auto-connect did not run).
+# Google Chrome WM_CLASS is "Google-chrome"; Chromium is "Chromium".
+# A single --sync --class Chromium blocks forever when using Google Chrome, so ffmpeg never starts.
 if command -v xdotool >/dev/null 2>&1; then
-  xdotool search --sync --onlyvisible --class Chromium windowactivate 2>/dev/null || true
+  _xd_done=
+  if command -v timeout >/dev/null 2>&1; then
+    for _class in Google-chrome Chromium; do
+      if timeout 5 xdotool search --sync --onlyvisible --class "$_class" windowactivate 2>/dev/null; then
+        _xd_done=1
+        break
+      fi
+    done
+  fi
+  if [[ -z "${_xd_done:-}" ]]; then
+    for _ in $(seq 1 40); do
+      for _class in Google-chrome Chromium; do
+        _wid=$(xdotool search --onlyvisible --class "$_class" 2>/dev/null | head -1 || true)
+        if [[ -n "${_wid:-}" ]]; then
+          xdotool windowactivate "$_wid" 2>/dev/null || true
+          _xd_done=1
+          break 2
+        fi
+      done
+      sleep 0.5
+    done
+  fi
   sleep 0.5
   xdotool key Return 2>/dev/null || true
 fi

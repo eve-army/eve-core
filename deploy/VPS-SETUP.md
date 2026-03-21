@@ -222,6 +222,7 @@ The unit creates `/run/user/<eve-uid>` for Pulse; alternatively enable lingering
 
 | Symptom | What to check |
 |--------|----------------|
+| **No stream on pump**, unit “running” but **no `ffmpeg` in** `systemctl status` cgroup | Old `xdotool` used `--class Chromium` only; **Google Chrome** never matched, so `xdotool --sync` blocked and ffmpeg never started. Update [eve-browser-rtmp.sh](./scripts/eve-browser-rtmp.sh) on the server and restart the unit (script tries `Google-chrome` then `Chromium`, with `timeout` + fallback poll). |
 | Black video | `DISPLAY=:99`; Xvfb running; wait longer before ffmpeg; try non-kiosk window size |
 | No audio on stream | `pactl list short sinks` includes `eve_stream_sink`; Chromium must use default sink (`PULSE_SINK` is set in the script) |
 | **Broken pipe** / TLS errors | Same as §4 — one publisher per key; key rotated; network |
