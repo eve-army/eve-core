@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 
 import { generateHuggingFaceTts, downloadAndProcessVoiceModel, testHFSpace } from '@/lib/hf-voice';
+import SiteFooter from '@/components/SiteFooter';
 
 import { Connection, PublicKey } from "@solana/web3.js";
 import { OnlinePumpSdk } from "@pump-fun/pump-sdk";
@@ -1127,7 +1128,7 @@ export default function PumpfunChatPage({
   }, [priceHistory]);
 
   return (
-    <div className="h-screen bg-[#050508] text-white flex flex-col font-sans selection:bg-cyan-500/30 overflow-hidden">
+    <div className="h-dvh bg-[#050508] text-white flex flex-col font-sans selection:bg-cyan-500/30 overflow-hidden">
       {/* Full-bleed background */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none z-0">
         <div className="absolute top-0 left-0 right-0 h-[50%] bg-gradient-to-b from-cyan-950/25 via-transparent to-transparent" />
@@ -1136,8 +1137,9 @@ export default function PumpfunChatPage({
         <div className="absolute bottom-[-15%] right-[-5%] w-[50%] h-[50%] bg-fuchsia-600/15 blur-[140px] rounded-full" />
       </div>
 
+      <div className="relative z-10 flex flex-1 min-h-0 flex-col pb-[3.25rem] sm:pb-14">
       {/* Compact header: branding + connect inline, gradient accent line */}
-      <header className="relative z-20 flex items-center justify-between gap-4 px-4 sm:px-6 lg:px-8 py-3 bg-black/30 backdrop-blur-xl">
+      <header className="relative z-20 flex items-center justify-between gap-4 px-4 sm:px-6 lg:px-8 py-3 bg-black/30 backdrop-blur-xl shrink-0">
         <div className="absolute bottom-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-cyan-500/40 to-fuchsia-500/40" aria-hidden />
         <div className="flex items-center gap-3 min-w-0">
           <img src="/clawk.png" alt="EVE" className="w-10 h-10 rounded-xl object-contain bg-white/5 flex-shrink-0 ring-1 ring-white/10 shadow-sm" />
@@ -1506,6 +1508,9 @@ export default function PumpfunChatPage({
             </div>
           </div>
       </main>
+      </div>
+
+      <SiteFooter />
 
       <AnimatePresence>
         {showAddVoice && (
