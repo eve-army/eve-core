@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import type { EveStreamPublicConfig } from "./stream-config";
 import { IMessage } from '@/lib/pumpChatClient';
 import { motion, AnimatePresence } from "framer-motion";
@@ -21,6 +21,251 @@ import {
 
 import { generateHuggingFaceTts, downloadAndProcessVoiceModel, testHFSpace } from '@/lib/hf-voice';
 import SiteFooter from '@/components/SiteFooter';
+import dynamic from "next/dynamic";
+import type { DedupedTrend, LiveTrendRow } from "@/lib/live-trends";
+import {
+  dedupeTrendsByName,
+  buildTrendPolarScatterData,
+  trendDisplayNamesMatch,
+} from "@/lib/live-trends";
+import {
+  buildProportionalHighlightTimeline,
+  VOICE_HIGHLIGHT_LINGER_SEC,
+  type VoiceHighlightSegment,
+} from "@/lib/voice-highlight-timeline";
+import { isPumpSpamScamMessage } from "@/lib/pump-chat-filters";
+import { buildRecentChatTranscript } from "@/lib/agent-chat-context";
+import TrendHeatLeaderboard from "@/components/TrendHeatLeaderboard";
+
+const TrendRadarChart = dynamic(() => import("@/components/TrendRadarChart"), {
+  ssr: false,
+  loading: () => (
+    <div className="w-full min-h-[220px] rounded-xl border border-white/10 bg-black/20 animate-pulse" />
+  ),
+});
+
+/** Min 5s; default poll 15s when env unset (was 45s). Align with `NEXT_PUBLIC_LIVE_TRENDS_POLL_MS`. */
+const LIVE_POLL_MS = Math.max(
+  5_000,
+  Number(
+    typeof process !== "undefined"
+      ? process.env.NEXT_PUBLIC_LIVE_TRENDS_POLL_MS
+      : undefined,
+  ) || 15_000,
+);
+const TREND_TICK_MIN_MS = 4 * 60 * 1000;
+const VOTE_GOAL_DEFAULT = 15;
+const VOTE_COOLDOWN_MS = 12_000;
+const VOTE_SUMMARY_COOLDOWN_MS = 90_000;
+/** Host banter check interval; actual spacing uses silence decay inside handler. */
+const HOST_BANTER_CHECK_MS = 30_000;
+/** Abort agent API fetch if the server or network hangs. */
+const AGENT_FETCH_TIMEOUT_MS = 90_000;
+/** HF Gradio TTS can stall indefinitely; fall back to text-only after this. */
+const HF_TTS_TIMEOUT_MS = 180_000;
+/** If playback never finishes, reset so the poller can run again. */
+const TTS_STUCK_WATCHDOG_MS = 4 * 60 * 1000;
+
+/**
+ * Create/resume Web Audio on a real user gesture so TTS can play later.
+ * Browsers block AudioContext started only from timers (e.g. chat poll).
+ * Returns true if the context is running after this call (valid for TTS / visualizer).
+ */
+async function primeWebAudioContext(
+  audioContextRef: React.MutableRefObject<AudioContext | null>,
+): Promise<boolean> {
+  try {
+    const AC =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext })
+        .webkitAudioContext;
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AC();
+    }
+    const ctx = audioContextRef.current;
+    if (ctx.state === "suspended") {
+      await ctx.resume();
+    }
+    if (ctx.state !== "running") {
+      return false;
+    }
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    gain.gain.value = 0.00001;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.05);
+    return ctx.state === "running";
+  } catch (e) {
+    console.warn("Web Audio prime failed:", e);
+    return false;
+  }
+}
+
+type AgentCallOptions = {
+  agentMode?: "chat_reply" | "trend_tick" | "vote_summary" | "host_banter";
+  activeTrendSpeaking?: string | null;
+};
+
+function syntheticAgentMessage(
+  partial: Partial<IMessage> & { message: string },
+): IMessage {
+  return {
+    id: partial.id ?? `sys-${Date.now()}`,
+    roomId: partial.roomId ?? "eve",
+    username: partial.username ?? "Eve",
+    userAddress: partial.userAddress ?? "",
+    message: partial.message,
+    profile_image: partial.profile_image ?? "",
+    timestamp: partial.timestamp ?? new Date().toISOString(),
+    messageType: partial.messageType ?? "system",
+    expiresAt: partial.expiresAt ?? 0,
+  };
+}
+
+const SYNTHETIC_AGENT_USERNAMES = new Set(
+  ["trendradar", "votebooth", "hostfill"].map((s) => s.toLowerCase()),
+);
+
+/** Rows that trigger the agent but are not in the live pump feed — shown ephemerally during TTS. */
+function isSyntheticChatAgentRow(msg: IMessage): boolean {
+  const u = (msg.username || "").trim().toLowerCase();
+  if (SYNTHETIC_AGENT_USERNAMES.has(u)) return true;
+  const id = msg.id || "";
+  return (
+    id.startsWith("trend-tick-") ||
+    id.startsWith("host-banter-") ||
+    id.startsWith("vote-sum-") ||
+    id.startsWith("winner-")
+  );
+}
+
+/**
+ * One-shot after connect: scan back through history for the latest real line (spam often clogs the tail).
+ * After that pass we only consider the last 2 messages so we don’t auto-reply backward through old chat.
+ */
+const AGENT_CATCH_UP_LOOKBACK = 100;
+const AGENT_POLL_TAIL = 2;
+
+function findLatestUnansweredChatMessage(
+  messages: IMessage[],
+  messageStatuses: Record<string, "processing" | "answered" | "history">,
+  lookback: number,
+): IMessage | null {
+  const start = Math.max(0, messages.length - lookback);
+  for (let i = messages.length - 1; i >= start; i--) {
+    const msg = messages[i];
+    if (!msg) continue;
+    if (messageStatuses[msg.id]) continue;
+    if (isSyntheticChatAgentRow(msg)) continue;
+
+    const trimmed = (msg.message || "").trim();
+    if (trimmed.length <= 3) continue;
+    if (isVoteOnlyMessage(msg.message)) continue;
+    if (isPumpSpamScamMessage(trimmed)) continue;
+    if (/^(lfg|gm|gn|wow|lol|lmao)$/i.test(trimmed)) continue;
+
+    return msg;
+  }
+  return null;
+}
+
+/** If the API omitted highlightTrendName, match spoken text to a live trend name (substring). */
+function inferVoiceHighlightFromReply(
+  reply: string,
+  trends: DedupedTrend[],
+): string | null {
+  const t = reply.trim();
+  if (!t || trends.length === 0) return null;
+  const lower = t.toLowerCase();
+  const names = [...trends]
+    .map((x) => x.trend_name)
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+  for (const name of names) {
+    const n = name.trim();
+    if (n.length < 3) continue;
+    if (lower.includes(n.toLowerCase())) return n;
+  }
+  return null;
+}
+
+/** Poll resume until the context runs or timeout (needed after timer-driven TTS). */
+async function ensureAudioContextRunning(
+  ctx: AudioContext,
+  maxWaitMs = 2800,
+): Promise<boolean> {
+  const running = () => String(ctx.state) === "running";
+  const t0 = performance.now();
+  while (performance.now() - t0 < maxWaitMs) {
+    if (ctx.state === "closed") return false;
+    if (running()) return true;
+    await ctx.resume().catch(() => {});
+    if (running()) return true;
+    await new Promise((r) => window.setTimeout(r, 50));
+  }
+  return running();
+}
+
+/** Route HTMLAudioElement through Web Audio so the rim visualizer sees frequency data. */
+function tryAttachMediaElementVisualizer(
+  audio: HTMLAudioElement,
+  ctx: AudioContext,
+  audioAnalyzerRef: React.MutableRefObject<{
+    analyser: AnalyserNode;
+    data: Uint8Array;
+  } | null>,
+): void {
+  if (ctx.state !== "running") return;
+  try {
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.45;
+    analyser.minDecibels = -100;
+    analyser.maxDecibels = -20;
+    const src = ctx.createMediaElementSource(audio);
+    src.connect(analyser);
+    analyser.connect(ctx.destination);
+    audioAnalyzerRef.current = {
+      analyser,
+      data: new Uint8Array(analyser.frequencyBinCount),
+    };
+  } catch {
+    /* e.g. CORS or second createMediaElementSource on same element */
+  }
+}
+
+function isVoteOnlyMessage(text: string): boolean {
+  return /^!(?:vote|v|pick)\b/i.test(text.trim());
+}
+
+function parseChatVote(
+  text: string,
+  trendOptions: string[],
+): { key: string } | null {
+  const t = text.trim();
+  const num = t.match(/^(?:!vote|!v)\s+(\d+)\s*$/i);
+  if (num) {
+    const idx = parseInt(num[1], 10) - 1;
+    if (idx >= 0 && idx < trendOptions.length) return { key: trendOptions[idx] };
+    return null;
+  }
+  const pick = t.match(/^!pick\s+(.+)$/i);
+  if (pick) {
+    const q = pick[1].trim().toLowerCase();
+    if (!q) return null;
+    const exact = trendOptions.find((n) => n.toLowerCase() === q);
+    if (exact) return { key: exact };
+    const sub = trendOptions.find(
+      (n) =>
+        n.toLowerCase().includes(q) ||
+        (q.length >= 3 && n.toLowerCase().includes(q.slice(0, 14))),
+    );
+    if (sub) return { key: sub };
+  }
+  return null;
+}
 
 import { Connection, PublicKey } from "@solana/web3.js";
 import { OnlinePumpSdk } from "@pump-fun/pump-sdk";
@@ -81,356 +326,6 @@ function getSolInCurve(bondingCurveData: any): number | null {
   }
 }
 
-const NUM_BARS = 192;
-const INNER_RADIUS_BASE = 42;
-const MAX_BAR_LENGTH_BASE = 58;
-const BAR_WIDTH_BASE = 1.6;
-const OUTER_RING_OFFSET = 0.5;
-const MID_RING_OFFSET = 0.25;
-const NUM_PARTICLES = 52;
-const VISUALIZER_SIZE = 560;
-
-const SMOOTHING = 0.55; // temporal smoothing: higher = smoother, less jitter
-const SPEECH_DECAY = 0.92; // when speech ends, level decays per frame (smooth fade-out)
-const BAR_DECAY = 0.88; // when speech ends, bar levels decay toward wave per frame
-
-function BondingCurveVisualizer({
-  bondingCurveData,
-  isBondedToken,
-  currentMcSol,
-  solUsdPrice,
-  isPlayingTTS,
-  audioAnalyzerRef,
-  priceHistory,
-}: {
-  bondingCurveData: any;
-  isBondedToken: boolean;
-  currentMcSol: number | null;
-  solUsdPrice: number | null;
-  isPlayingTTS: boolean;
-  audioAnalyzerRef: React.MutableRefObject<{ analyser: AnalyserNode; data: Uint8Array } | null>;
-  priceHistory: { timestamp: number; mcSol: number }[];
-}) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const prevBarLevelsRef = useRef<Float32Array | null>(null);
-  const prevSpeechLevelRef = useRef<number>(0);
-  const progress = isBondedToken ? 100 : getBondingProgressPercent(bondingCurveData);
-  const solInCurve = getSolInCurve(bondingCurveData);
-  const isComplete = isBondedToken || !!bondingCurveData?.complete;
-  const hasData = isBondedToken || (progress !== null && solInCurve !== null);
-
-  const progressNorm = hasData ? progress! / 100 : 0;
-  const size = VISUALIZER_SIZE;
-  const scale = size / 340;
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    let frameId: number;
-    let startTime = performance.now();
-
-    const draw = () => {
-      const t = (performance.now() - startTime) * 0.001;
-      const w = canvas.width;
-      const h = canvas.height;
-      const cx = w / 2;
-      const cy = h / 2;
-
-      const INNER_RADIUS = INNER_RADIUS_BASE * scale;
-      const MAX_BAR_LENGTH = MAX_BAR_LENGTH_BASE * scale;
-      const BAR_WIDTH = BAR_WIDTH_BASE * scale;
-      const midRingRadius = INNER_RADIUS + MAX_BAR_LENGTH * 0.45;
-      const outerRingRadius = INNER_RADIUS + MAX_BAR_LENGTH + 8;
-
-      ctx.clearRect(0, 0, w, h);
-
-      // Real-time audio: get frequency data, symmetric mapping, temporal smoothing
-      const analyzer = audioAnalyzerRef.current;
-      const speed = isPlayingTTS ? 3.5 : 1.3;
-      let speechLevel = 0;
-      const barAudioLevels = new Float32Array(NUM_BARS);
-      const AUDIO_GAIN = 2.2;
-      if (analyzer) {
-        analyzer.analyser.getByteFrequencyData(analyzer.data as any);
-        const freq = analyzer.data;
-        let sum = 0;
-        for (let j = 0; j < freq.length; j++) sum += freq[j];
-        const rawSpeech = Math.min(1, (sum / (freq.length * 255)) * 1.8);
-        speechLevel = prevSpeechLevelRef.current * SMOOTHING + rawSpeech * (1 - SMOOTHING);
-        prevSpeechLevelRef.current = speechLevel;
-        for (let i = 0; i < NUM_BARS; i++) {
-          const pos = i / NUM_BARS;
-          const spectrumT = pos <= 0.5 ? pos * 2 : (1 - pos) * 2;
-          const binExact = spectrumT * (freq.length - 1);
-          const binIndex = Math.floor(binExact);
-          const nextBin = Math.min(binIndex + 1, freq.length - 1);
-          const frac = binExact - binIndex;
-          const v = freq[binIndex] * (1 - frac) + freq[nextBin] * frac;
-          const raw = Math.min(1, (v / 255) * AUDIO_GAIN);
-          barAudioLevels[i] = prevBarLevelsRef.current
-            ? prevBarLevelsRef.current[i] * SMOOTHING + raw * (1 - SMOOTHING)
-            : raw;
-        }
-        prevBarLevelsRef.current = barAudioLevels.slice();
-      } else {
-        // Smooth fade-out: decay speech level and morph bars toward wave
-        speechLevel = prevSpeechLevelRef.current * SPEECH_DECAY;
-        prevSpeechLevelRef.current = speechLevel;
-        for (let i = 0; i < NUM_BARS; i++) {
-          const wave1 = Math.sin(t * speed * 2 + i * 0.32) * 0.5 + 0.5;
-          const wave2 = Math.sin(t * speed * 1.4 + i * 0.18) * 0.4 + 0.5;
-          const wave3 = Math.sin(t * speed * 3.2 + i * 0.48) * 0.35 + 0.5;
-          const wave4 = Math.sin(t * speed * 0.9 + i * 0.25) * 0.25 + 0.5;
-          const wave = (wave1 + wave2 + wave3 + wave4) / 4;
-          barAudioLevels[i] = prevBarLevelsRef.current
-            ? prevBarLevelsRef.current[i] * BAR_DECAY + wave * (1 - BAR_DECAY)
-            : wave;
-        }
-        prevBarLevelsRef.current = barAudioLevels.slice();
-      }
-
-      const baseLevel = progressNorm * 0.88 + 0.06;
-      const ttsBoost = speechLevel * 1.8;
-
-      // ---- 1) TTS burst rings (scaled) - fade with speechLevel ----
-      if (speechLevel > 0.015) {
-        for (let b = 0; b < 5; b++) {
-          const phase = (t * 2.8 + b * 0.2) % 1;
-          const r = (22 + phase * 100) * scale;
-          const alpha = (1 - phase) * 0.7 * Math.min(1, speechLevel * 1.5);
-          ctx.strokeStyle = `rgba(0, 245, 255, ${alpha})`;
-          ctx.lineWidth = Math.max(2, 3 * scale);
-          ctx.beginPath();
-          ctx.arc(cx, cy, r, 0, Math.PI * 2);
-          ctx.stroke();
-        }
-      }
-
-      // ---- 2) Orbiting particles (scaled, more of them) ----
-      for (let p = 0; p < NUM_PARTICLES; p++) {
-        const orbitAngle = t * 0.8 + p * 0.22 + (p % 3) * 0.7;
-        const orbitRadius = (18 + (p % 5) * 12 + progressNorm * 10) * scale;
-        const px = cx + Math.cos(orbitAngle) * orbitRadius;
-        const py = cy + Math.sin(orbitAngle) * orbitRadius;
-        const pulse = 0.5 + 0.5 * Math.sin(t * 4 + p * 0.5);
-        const speechBoost = 0.2 + speechLevel * 1.1;
-        const particleAlpha = Math.min(1, (0.3 + progressNorm * 0.3 + speechBoost) * pulse);
-        const particleSize = (1.4 + (p % 2) * 0.6 + speechLevel * 1.6) * scale;
-        const hueP = (260 + progressNorm * 80 + p * 3) % 360;
-        ctx.fillStyle = `hsla(${hueP}, 90%, 75%, ${particleAlpha})`;
-        ctx.beginPath();
-        ctx.arc(px, py, particleSize, 0, Math.PI * 2);
-        ctx.fill();
-      }
-
-      // ---- 3) Center radar sweep ----
-      const sweepAngle = (t * 0.6) % (Math.PI * 2);
-      const sweepWidth = 0.22 * Math.PI;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.arc(cx, cy, INNER_RADIUS + 6, sweepAngle, sweepAngle + sweepWidth);
-      ctx.closePath();
-      const sweepGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, INNER_RADIUS + 6);
-      sweepGrad.addColorStop(0, "rgba(0, 245, 255, 0.25)");
-      sweepGrad.addColorStop(0.6, "rgba(180, 0, 255, 0.06)");
-      sweepGrad.addColorStop(1, "rgba(0, 245, 255, 0)");
-      ctx.fillStyle = sweepGrad;
-      ctx.fill();
-
-      // ---- 4) Bar rings: always use barAudioLevels (smooth transition speech ↔ wave) ----
-      const hue = (238 + progressNorm * 100 + (speechLevel > 0.05 ? Math.sin(t * 2.5) * 35 : 0)) % 360;
-      const sat = 92;
-      const drawBar = (
-        fromX: number, fromY: number, toX: number, toY: number,
-        alpha: number, glowWidth: number, lightMod: number
-      ) => {
-        const light = 52 + lightMod;
-        const g = ctx.createLinearGradient(fromX, fromY, toX, toY);
-        g.addColorStop(0, `hsla(${hue}, ${sat}%, ${light}%, ${alpha * 0.5})`);
-        g.addColorStop(0.4, `hsla(${hue}, ${sat}%, 72%, ${alpha})`);
-        g.addColorStop(0.8, `hsla(${(hue + 55) % 360}, ${sat}%, 80%, ${alpha})`);
-        g.addColorStop(1, `hsla(${(hue + 70) % 360}, ${sat}%, 85%, ${alpha * 0.9})`);
-        ctx.strokeStyle = `hsla(${hue}, ${sat}%, 78%, ${alpha * 0.35})`;
-        ctx.lineWidth = BAR_WIDTH + glowWidth;
-        ctx.lineCap = "round";
-        ctx.beginPath();
-        ctx.moveTo(fromX, fromY);
-        ctx.lineTo(toX, toY);
-        ctx.stroke();
-        ctx.strokeStyle = g;
-        ctx.lineWidth = BAR_WIDTH;
-        ctx.beginPath();
-        ctx.moveTo(fromX, fromY);
-        ctx.lineTo(toX, toY);
-        ctx.stroke();
-      };
-
-      for (let i = 0; i < NUM_BARS; i++) {
-        const angle = (i / NUM_BARS) * Math.PI * 2 - Math.PI / 2;
-        const angleMid = angle + MID_RING_OFFSET * (Math.PI * 2 / NUM_BARS);
-        const angleOuter = angle + OUTER_RING_OFFSET * (Math.PI * 2 / NUM_BARS);
-
-        const wave1 = Math.sin(t * speed * 2 + i * 0.32) * 0.5 + 0.5;
-        const wave2 = Math.sin(t * speed * 1.4 + i * 0.18) * 0.4 + 0.5;
-        const wave3 = Math.sin(t * speed * 3.2 + i * 0.48) * 0.35 + 0.5;
-        const wave4 = Math.sin(t * speed * 0.9 + i * 0.25) * 0.25 + 0.5;
-        const wave = (wave1 + wave2 + wave3 + wave4) / 4;
-        const audioNorm = barAudioLevels[i];
-        const barBlend = 0.12 * wave + 0.88 * audioNorm;
-        const barLength = (baseLevel + barBlend * 0.85 + ttsBoost * 0.55) * MAX_BAR_LENGTH;
-        const barLengthClamped = Math.max(2, Math.min(MAX_BAR_LENGTH, barLength));
-
-        const waveM1 = Math.sin(t * speed * 2.1 + i * 0.33 + 0.9) * 0.5 + 0.5;
-        const waveM2 = Math.sin(t * speed * 1.35 + i * 0.19) * 0.4 + 0.5;
-        const waveM = (waveM1 + waveM2) / 2;
-        const midAudio = (barAudioLevels[i] + barAudioLevels[(i + 1) % NUM_BARS]) / 2;
-        const midBlend = 0.1 * waveM + 0.9 * midAudio;
-        const midLen = (baseLevel * 0.8 + midBlend * 0.8 + ttsBoost * 0.5) * (MAX_BAR_LENGTH * 0.55);
-        const midLenClamped = Math.max(2, Math.min(MAX_BAR_LENGTH * 0.55, midLen));
-
-        const waveO1 = Math.sin(t * speed * 2.3 + i * 0.35 + 1.5) * 0.5 + 0.5;
-        const waveO2 = Math.sin(t * speed * 1.15 + i * 0.21 + 0.8) * 0.4 + 0.5;
-        const waveO = (waveO1 + waveO2) / 2;
-        const outerBlend = 0.1 * waveO + 0.9 * barAudioLevels[(i + 2) % NUM_BARS];
-        const outerBarMax = 24 * scale;
-        const barLengthOuter = (baseLevel * 0.6 + outerBlend * 0.75 + ttsBoost * 0.5) * outerBarMax;
-        const barLengthOuterClamped = Math.max(2, Math.min(outerBarMax, barLengthOuter));
-
-        const lightMod = audioNorm * 35;
-
-        const innerX = cx + Math.cos(angle) * INNER_RADIUS;
-        const innerY = cy + Math.sin(angle) * INNER_RADIUS;
-        const outerX = cx + Math.cos(angle) * (INNER_RADIUS + barLengthClamped);
-        const outerY = cy + Math.sin(angle) * (INNER_RADIUS + barLengthClamped);
-        drawBar(innerX, innerY, outerX, outerY, 1, 10, lightMod);
-
-        const midStartX = cx + Math.cos(angleMid) * midRingRadius;
-        const midStartY = cy + Math.sin(angleMid) * midRingRadius;
-        const midEndX = cx + Math.cos(angleMid) * (midRingRadius + midLenClamped);
-        const midEndY = cy + Math.sin(angleMid) * (midRingRadius + midLenClamped);
-        drawBar(midStartX, midStartY, midEndX, midEndY, 0.88, 7, lightMod * 0.9);
-
-        const outerStartX = cx + Math.cos(angleOuter) * outerRingRadius;
-        const outerStartY = cy + Math.sin(angleOuter) * outerRingRadius;
-        const outerEndX = cx + Math.cos(angleOuter) * (outerRingRadius + barLengthOuterClamped);
-        const outerEndY = cy + Math.sin(angleOuter) * (outerRingRadius + barLengthOuterClamped);
-        drawBar(outerStartX, outerStartY, outerEndX, outerEndY, 0.78, 6, lightMod * 0.8);
-      }
-
-      // ---- 5) Inner core glow: much brighter with speech ----
-      const circleGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, INNER_RADIUS + 22);
-      circleGrad.addColorStop(0, `rgba(0, 245, 255, ${0.12 + speechLevel * 0.5})`);
-      circleGrad.addColorStop(0.5, `rgba(160, 0, 255, ${0.04 + speechLevel * 0.12})`);
-      circleGrad.addColorStop(1, "rgba(0, 245, 255, 0)");
-      ctx.fillStyle = circleGrad;
-      ctx.beginPath();
-      ctx.arc(cx, cy, INNER_RADIUS + 28, 0, Math.PI * 2);
-      ctx.fill();
-
-      // ---- 6) Outer halo (scaled) - fade with speechLevel ----
-      if (speechLevel > 0.01) {
-        const haloAlpha = 0.08 + 0.22 * speechLevel * (0.8 + 0.4 * Math.sin(t * 5));
-        ctx.strokeStyle = `rgba(0, 245, 255, ${Math.min(1, haloAlpha)})`;
-        ctx.lineWidth = Math.max(3, 4 * scale);
-        ctx.beginPath();
-        ctx.arc(cx, cy, 132 * scale, 0, Math.PI * 2);
-        ctx.stroke();
-      }
-
-      // ---- 7) Rotating dashed "energy" ring for extra motion ----
-      const dashAngle = (t * 0.4) % (Math.PI * 2);
-      ctx.strokeStyle = `rgba(0, 245, 255, ${0.06 + 0.04 * Math.sin(t * 2)})`;
-      ctx.lineWidth = 1.5 * scale;
-      ctx.setLineDash([4 * scale, 8 * scale]);
-      ctx.beginPath();
-      ctx.arc(cx, cy, outerRingRadius + 15 * scale, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      frameId = requestAnimationFrame(draw);
-    };
-
-    draw();
-    return () => cancelAnimationFrame(frameId);
-  }, [progressNorm, isPlayingTTS, isComplete, audioAnalyzerRef]);
-
-  return (
-    <div className="relative mb-8 flex flex-col items-center">
-      <div
-        className="relative rounded-full overflow-visible transition-all duration-500"
-        style={{
-          width: size,
-          height: size,
-          filter: isPlayingTTS
-            ? "drop-shadow(0 0 45px rgba(0,245,255,0.5)) drop-shadow(0 0 90px rgba(180,0,255,0.2))"
-            : "drop-shadow(0 0 32px rgba(160,0,255,0.3)) drop-shadow(0 0 60px rgba(0,200,255,0.1))",
-          transform: isPlayingTTS ? "scale(1.02)" : "scale(1)",
-        }}
-      >
-        <canvas
-          ref={canvasRef}
-          width={size}
-          height={size}
-          className="block w-full h-full rounded-full"
-          style={{ background: "transparent" }}
-        />
-        {/* Center overlay: dark only in center so bars show at edges */}
-        <div
-          className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none rounded-full"
-          style={{
-            background: "radial-gradient(circle at center, rgba(0,0,0,0.88) 0%, rgba(0,0,0,0.4) 28%, transparent 55%)",
-            width: size,
-            height: size,
-            top: 0,
-            left: 0,
-          }}
-        >
-          {(!hasData && !currentMcSol) ? (
-            <p className="text-sm text-cyan-400/80 text-center px-4 font-medium">Connect a token</p>
-          ) : (
-            <>
-              {hasData && progressNorm < 1 && bondingCurveData?.realTokenReserves != null && (
-                <>
-                  <span className="text-[10px] font-mono text-gray-500 uppercase tracking-wider">Pending</span>
-                  <span className="text-[1.75rem] sm:text-3xl font-black tabular-nums text-transparent bg-clip-text bg-gradient-to-b from-cyan-300 to-fuchsia-400">
-                    {(() => {
-                      const currentTokens = BigInt(bondingCurveData.realTokenReserves);
-                      const initialTokens = BigInt("793100000000000");
-                      return `${(Number((currentTokens * BigInt("10000")) / initialTokens) / 100).toFixed(1)}%`;
-                    })()}
-                  </span>
-                </>
-              )}
-              {isBondedToken && (
-                <span className="text-xs sm:text-sm font-mono text-cyan-400 uppercase tracking-wider font-bold mb-1">Bonded on Raydium</span>
-              )}
-              {currentMcSol !== null && currentMcSol > 0 && (
-                <>
-                  <span className="text-[10px] font-mono text-gray-500 uppercase tracking-wider mt-2">Market Cap</span>
-                  <div className="flex flex-col items-center leading-tight mt-1">
-                    <span className="text-xs sm:text-sm font-bold tabular-nums text-white">
-                      {currentMcSol.toFixed(2)} SOL
-                    </span>
-                    {solUsdPrice && (
-                      <span className="text-[10px] sm:text-[11px] font-mono tabular-nums text-green-400 mt-0.5">
-                        ${(currentMcSol * solUsdPrice).toLocaleString('en-US', {maximumFractionDigits:0})}
-                      </span>
-                    )}
-                  </div>
-                </>
-              )}
-            </>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export default function PumpfunChatPage({
   defaultRoom,
   streamUsername,
@@ -445,18 +340,26 @@ export default function PumpfunChatPage({
   const [isConnecting, setIsConnecting] = useState(false);
   const [messages, setMessages] = useState<IMessage[]>([]);
   const [error, setError] = useState<string | null>(null);
+  /** Reconnect / SSE status; shown inline with stream name so layout height stays stable. */
+  const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
 
   // AI Agent state
   const [isPlayingTTS, setIsPlayingTTS] = useState(false);
   const [activeMessageId, setActiveMessageId] = useState<string | null>(null);
-  const [aiResponseText, setAiResponseText] = useState<string | null>(null);
   const [hfStatus, setHfStatus] = useState<{stage: string, position?: number, eta?: number} | null>(null);
   const [bondingCurveData, setBondingCurveData] = useState<any>(null);
   const [isBondedToken, setIsBondedToken] = useState<boolean>(false);
   const [solUsdPrice, setSolUsdPrice] = useState<number | null>(null);
   const [priceHistory, setPriceHistory] = useState<{ timestamp: number; mcSol: number }[]>([]);
+  const latestMcSol = useMemo(() => {
+    if (priceHistory.length === 0) return null;
+    const v = priceHistory[priceHistory.length - 1].mcSol;
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }, [priceHistory]);
   const [historicalPriceData, setHistoricalPriceData] = useState<any>(null);
-  
+  /** Recharts ResponsiveContainer measures DOM; defer chart until mounted (hydration-safe). */
+  const [mcChartMounted, setMcChartMounted] = useState(false);
+
   // Stream Info State (manual entry or from EVE_STREAM_NAME / EVE_STREAM_TICKER)
   const [streamName, setStreamName] = useState(() => initialStreamName.trim());
   const [streamSymbol, setStreamSymbol] = useState(() =>
@@ -467,11 +370,109 @@ export default function PumpfunChatPage({
   const [customVoices, setCustomVoices] = useState<{name: string, id: string}[]>([]);
   const [selectedVoice, setSelectedVoice] = useState<string>("elevenlabs_default");
   const [isLoadingVoices, setIsLoadingVoices] = useState<boolean>(true);
-  
+
   const [showAddVoice, setShowAddVoice] = useState(false);
   const [newVoiceName, setNewVoiceName] = useState("");
   const [newVoiceUrl, setNewVoiceUrl] = useState("");
   const [isAddingVoice, setIsAddingVoice] = useState(false);
+
+  const [liveTrendRows, setLiveTrendRows] = useState<LiveTrendRow[]>([]);
+  const [trendsFetchedAt, setTrendsFetchedAt] = useState<string | null>(null);
+  const [trendsError, setTrendsError] = useState<string | null>(null);
+  const [voteTally, setVoteTally] = useState<Record<string, number>>({});
+  const voteCooldownRef = useRef<Record<string, number>>({});
+  const [winningTrend, setWinningTrend] = useState<string | null>(null);
+  const [speechPulse, setSpeechPulse] = useState(0);
+  const [activeTrendHighlight, setActiveTrendHighlight] = useState<
+    string | null
+  >(null);
+
+  /** Sync radar highlight to spoken mentions (ElevenLabs alignment or proportional fallback). */
+  const ttsHighlightScheduleRef = useRef<{
+    segments: VoiceHighlightSegment[];
+    mode: "buffer" | "html";
+    bufferCtxStartTime: number | null;
+    htmlAudio: HTMLAudioElement | null;
+  } | null>(null);
+  const lastSyncedHighlightRef = useRef<string | null>(null);
+
+  const voteOptionsRef = useRef<string[]>([]);
+  const dedupedRef = useRef<DedupedTrend[]>([]);
+  const trendTickGuardRef = useRef({
+    lastTop: null as string | null,
+    lastHeat: 0,
+    lastTickAt: 0,
+    seeded: false,
+  });
+  const voteLeaderPrevRef = useRef<string | null>(null);
+  const lastVoteSummaryAtRef = useRef(0);
+  const winnerAnnouncedRef = useRef(false);
+  /** Last time a real chatter sent a non-spam, non-vote message (for host banter decay). */
+  const lastRealChatAtRef = useRef(Date.now());
+  const hostBanterGuardRef = useRef({ lastAt: Date.now() });
+  /** Last successful agent TTS line (say) for continuity. */
+  const lastAgentSpokenRef = useRef<string | null>(null);
+  /** Increments each agent call for server-side style rotation. */
+  const varietySeedRef = useRef(0);
+  /**
+   * After a fresh connect (e.g. page refresh), run one poller pass with a wide lookback
+   * so spam at the chat tail doesn’t hide the latest real message.
+   */
+  const catchUpPollAfterConnectRef = useRef(false);
+  const triggerAgentRef = useRef<
+    (msg: IMessage, opts?: AgentCallOptions) => Promise<void>
+  >(async () => {});
+
+  /** Prior deduped maxHeat by trend name — for polar diff (new / heat up / down). */
+  const prevTrendHeatRef = useRef<Map<string, { maxHeat: number }>>(new Map());
+  /** Dev-only: log client spacing between successful polls. */
+  const lastTrendPullMsRef = useRef<number | null>(null);
+
+  const liveTrendsDeduped = useMemo(
+    () => dedupeTrendsByName(liveTrendRows),
+    [liveTrendRows],
+  );
+  /** Polar scatter from deduped trends; full deduped list still drives votes. */
+  const trendPolarData = useMemo(
+    () =>
+      buildTrendPolarScatterData(liveTrendsDeduped, {
+        previousByName: prevTrendHeatRef.current,
+      }),
+    [liveTrendsDeduped],
+  );
+
+  const radarVoiceBonding = useMemo(() => {
+    const progress = isBondedToken
+      ? 100
+      : getBondingProgressPercent(bondingCurveData);
+    const solInCurveBond = getSolInCurve(bondingCurveData);
+    const bondingHasData =
+      isBondedToken ||
+      (progress !== null && solInCurveBond !== null);
+    const progressNorm =
+      bondingHasData && progress !== null ? progress / 100 : 0;
+    return { progress, bondingHasData, progressNorm };
+  }, [isBondedToken, bondingCurveData]);
+
+  const voteGoal = Math.max(
+    3,
+    Number(
+      typeof process !== "undefined"
+        ? process.env.NEXT_PUBLIC_EVE_VOTE_GOAL
+        : undefined,
+    ) || VOTE_GOAL_DEFAULT,
+  );
+
+  const voteLeader = useMemo(() => {
+    const e = Object.entries(voteTally).sort((a, b) => b[1] - a[1]);
+    return e[0]?.[0] ?? null;
+  }, [voteTally]);
+
+  const top3Votes = useMemo(() => {
+    return Object.entries(voteTally)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3);
+  }, [voteTally]);
 
   const handleAddVoice = async () => {
     if (!newVoiceName || !newVoiceUrl) return;
@@ -494,6 +495,21 @@ export default function PumpfunChatPage({
   // Message Status State
   const [messageStatuses, setMessageStatuses] = useState<Record<string, 'processing' | 'answered' | 'history'>>({});
   const [aiReplies, setAiReplies] = useState<Record<string, string>>({});
+  /** Synthetic agent triggers (radar / host / vote) appended to chat UI while Eve speaks. */
+  const [agentEphemeralRow, setAgentEphemeralRow] = useState<IMessage | null>(
+    null,
+  );
+
+  const chatListMessages = useMemo(() => {
+    const list = [...messages];
+    if (
+      agentEphemeralRow &&
+      !list.some((m) => m.id === agentEphemeralRow.id)
+    ) {
+      list.push(agentEphemeralRow);
+    }
+    return list;
+  }, [messages, agentEphemeralRow]);
   
   // Track last played timestamp to avoid replaying the same broadcast
   const lastPlayedTimestampRef = useRef<number>(0);
@@ -504,9 +520,160 @@ export default function PumpfunChatPage({
 
   const clientRef = useRef<EventSource | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const connectHandshakeTimerRef = useRef<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const autoConnectRanRef = useRef(false);
-  
+
+  useEffect(() => {
+    setMcChartMounted(true);
+  }, []);
+
+  useEffect(() => {
+    voteOptionsRef.current = liveTrendsDeduped
+      .slice(0, 20)
+      .map((d) => d.trend_name);
+  }, [liveTrendsDeduped]);
+
+  useEffect(() => {
+    dedupedRef.current = liveTrendsDeduped;
+  }, [liveTrendsDeduped]);
+
+  useEffect(() => {
+    const last = messages[messages.length - 1];
+    if (!last) return;
+    const u = (last.username || "").trim().toLowerCase();
+    if (["trendradar", "votebooth", "hostfill", "eve"].includes(u)) return;
+    const text = last.message.trim();
+    if (text.length <= 3) return;
+    if (isVoteOnlyMessage(text)) return;
+    if (isPumpSpamScamMessage(text)) return;
+    if (/^(lfg|gm|gn|wow|lol|lmao)$/i.test(text)) return;
+    lastRealChatAtRef.current = Date.now();
+  }, [messages]);
+
+  useEffect(() => {
+    const m = new Map<string, { maxHeat: number }>();
+    for (const d of liveTrendsDeduped) {
+      const mh = Number.isFinite(d.maxHeat) ? d.maxHeat : 0;
+      m.set(d.trend_name, { maxHeat: mh });
+    }
+    prevTrendHeatRef.current = m;
+  }, [liveTrendsDeduped]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const res = await fetch("/api/live-trends", { cache: "no-store" });
+        const j = (await res.json()) as {
+          trends?: LiveTrendRow[];
+          fetchedAt?: string;
+          error?: string;
+        };
+        if (cancelled) return;
+        if (Array.isArray(j.trends)) {
+          if (process.env.NODE_ENV === "development") {
+            const t = Date.now();
+            const prevMs = lastTrendPullMsRef.current;
+            lastTrendPullMsRef.current = t;
+            if (prevMs != null) {
+              console.debug("[live-trends poll]", {
+                clientIntervalMs: t - prevMs,
+                fetchedAt: j.fetchedAt,
+                count: j.trends.length,
+              });
+            }
+          }
+          setLiveTrendRows(j.trends);
+          setTrendsFetchedAt(j.fetchedAt ?? new Date().toISOString());
+          setTrendsError(null);
+        } else {
+          setTrendsError(
+            typeof j.error === "string" ? j.error : "Invalid trends payload",
+          );
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setTrendsError(
+            e instanceof Error ? e.message : "Live trends request failed",
+          );
+        }
+      }
+    };
+    void pull();
+    const id = window.setInterval(pull, LIVE_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
+  useEffect(() => {
+    let raf = 0;
+    const tick = () => {
+      const a = audioAnalyzerRef.current;
+      if (a && isPlayingTTS) {
+        const n = a.analyser.frequencyBinCount;
+        const tmp = new Uint8Array(n);
+        a.analyser.getByteFrequencyData(tmp);
+        let s = 0;
+        for (let i = 0; i < n; i++) s += tmp[i];
+        let level = Math.min(1, (s / (n * 255)) * 2.2);
+        if (s < n * 3) {
+          const td = new Uint8Array(a.analyser.fftSize);
+          a.analyser.getByteTimeDomainData(td);
+          let pk = 0;
+          for (let i = 0; i < td.length; i++) {
+            const v = Math.abs(td[i]! - 128);
+            if (v > pk) pk = v;
+          }
+          level = Math.max(level, Math.min(1, (pk / 128) * 1.3));
+        }
+        setSpeechPulse((prev) => prev * 0.55 + level * 0.45);
+      } else {
+        setSpeechPulse((p) => p * 0.88);
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [isPlayingTTS]);
+
+  useEffect(() => {
+    if (!isPlayingTTS) return;
+    let raf = 0;
+    const tick = () => {
+      const sch = ttsHighlightScheduleRef.current;
+      let elapsed = -1;
+      if (sch?.mode === "html" && sch.htmlAudio) {
+        elapsed = sch.htmlAudio.currentTime;
+      } else if (
+        sch?.mode === "buffer" &&
+        audioContextRef.current &&
+        sch.bufferCtxStartTime != null
+      ) {
+        elapsed =
+          audioContextRef.current.currentTime - sch.bufferCtxStartTime;
+      }
+      let next: string | null = null;
+      if (elapsed >= 0 && sch?.segments?.length) {
+        for (const seg of sch.segments) {
+          if (elapsed >= seg.startSec && elapsed <= seg.endSec) {
+            next = seg.trendName;
+            break;
+          }
+        }
+      }
+      if (next !== lastSyncedHighlightRef.current) {
+        lastSyncedHighlightRef.current = next;
+        setActiveTrendHighlight(next);
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [isPlayingTTS]);
+
   // Auto-fetch HF Voice Models on load
   useEffect(() => {
     let isMounted = true;
@@ -559,23 +726,63 @@ export default function PumpfunChatPage({
   // Auto-fetch removed as pump.fun API is unavailable via proxy/CORS.
 
   // --- LOCAL AI ENGINE LOGIC ---
-  const stateRefs = useRef({ messages, messageStatuses, isPlayingTTS, bondingCurveData, priceHistory, streamName, isBondedToken, solUsdPrice, historicalPriceData });
+  const stateRefs = useRef({
+    messages,
+    messageStatuses,
+    isPlayingTTS,
+    bondingCurveData,
+    priceHistory,
+    streamName,
+    isBondedToken,
+    solUsdPrice,
+    historicalPriceData,
+    liveTrendsDeduped,
+    voteTally,
+    voteLeader,
+    aiReplies,
+  });
   useEffect(() => {
-    stateRefs.current = { messages, messageStatuses, isPlayingTTS, bondingCurveData, priceHistory, streamName, isBondedToken, solUsdPrice, historicalPriceData };
-  }, [messages, messageStatuses, isPlayingTTS, bondingCurveData, priceHistory, streamName, isBondedToken, solUsdPrice, historicalPriceData]);
+    stateRefs.current = {
+      messages,
+      messageStatuses,
+      isPlayingTTS,
+      bondingCurveData,
+      priceHistory,
+      streamName,
+      isBondedToken,
+      solUsdPrice,
+      historicalPriceData,
+      liveTrendsDeduped,
+      voteTally,
+      voteLeader,
+      aiReplies,
+    };
+  }, [
+    messages,
+    messageStatuses,
+    isPlayingTTS,
+    bondingCurveData,
+    priceHistory,
+    streamName,
+    isBondedToken,
+    solUsdPrice,
+    historicalPriceData,
+    liveTrendsDeduped,
+    voteTally,
+    voteLeader,
+    aiReplies,
+  ]);
 
   // Fetch Sol USD Price
   useEffect(() => {
     const fetchSolPrice = async () => {
       try {
-        // Jupiter v2 requires API keys for some origins now. Using Coingecko as a reliable alternative for simple price checks.
-        const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+        const res = await fetch("/api/price/sol");
         if (res.ok) {
-           const data = await res.json();
-           const price = data.solana?.usd;
-           if (price) {
-             setSolUsdPrice(parseFloat(price));
-           }
+          const data = (await res.json()) as { ok?: boolean; usd?: number };
+          if (data.ok && typeof data.usd === "number" && Number.isFinite(data.usd)) {
+            setSolUsdPrice(data.usd);
+          }
         }
       } catch (err) {
         console.error("Failed to fetch SOL price", err);
@@ -592,7 +799,7 @@ export default function PumpfunChatPage({
     const fetchMoralisHistory = async () => {
       if (!isBondedToken || !currentTokenAddress || currentTokenAddress === "unknown") return;
       try {
-        const url = `/api/agent/moralis?tokenAddress=${currentTokenAddress}`; 
+        const url = `/api/agent/moralis?tokenAddress=${encodeURIComponent(currentTokenAddress)}`;
         // Note: I will create the proxy endpoint /api/agent/moralis because Moralis blocks direct client-side requests due to CORS
         const response = await fetch(url);
         if (response.ok) {
@@ -771,16 +978,41 @@ export default function PumpfunChatPage({
     };
   }, [isConnected, currentTokenAddress]);
 
-  const triggerAgent = async (msgToProcess: IMessage) => {
-    if (stateRefs.current.isPlayingTTS) return;
-    
+  const triggerAgent = useCallback(
+    async (msgToProcess: IMessage, options?: AgentCallOptions) => {
+    if (stateRefs.current.isPlayingTTS) {
+      if (process.env.NODE_ENV === "development") {
+        console.warn(
+          "[Eve] triggerAgent skipped: isPlayingTTS already true (stuck run or overlapping call)",
+        );
+      }
+      return;
+    }
+
+    hostBanterGuardRef.current.lastAt = Date.now();
+    varietySeedRef.current += 1;
+    const varietySeed = varietySeedRef.current;
+    const recentChatTranscript = buildRecentChatTranscript(
+      stateRefs.current.messages,
+      stateRefs.current.aiReplies,
+    );
+    const lastAgentSay = lastAgentSpokenRef.current;
+
     setActiveMessageId(msgToProcess.id);
     setIsPlayingTTS(true);
-    setAiResponseText(null);
     setHfStatus(null);
+    if (isSyntheticChatAgentRow(msgToProcess)) {
+      setAgentEphemeralRow(msgToProcess);
+    } else {
+      setAgentEphemeralRow(null);
+    }
+
+    const agentMode = options?.agentMode ?? "chat_reply";
+    const activeSpeak = options?.activeTrendSpeaking ?? null;
 
     try {
-      setMessageStatuses(prev => ({ ...prev, [msgToProcess.id]: 'processing' }));
+      setError(null);
+      setMessageStatuses((prev) => ({ ...prev, [msgToProcess.id]: "processing" }));
 
       let change1m = null;
       let change5m = null;
@@ -788,183 +1020,578 @@ export default function PumpfunChatPage({
       if (history && history.length > 0) {
         const currentPrice = history[history.length - 1].mcSol;
         const now = Date.now();
-        
-        // Find price closest to 1 min ago
+
         const oneMinAgo = now - 60 * 1000;
-        const price1mRaw = history.reduce((prev, curr) => Math.abs(curr.timestamp - oneMinAgo) < Math.abs(prev.timestamp - oneMinAgo) ? curr : prev);
-        if (now - price1mRaw.timestamp > 30 * 1000) { // Should be at least 30s away
-          change1m = ((currentPrice - price1mRaw.mcSol) / price1mRaw.mcSol) * 100;
+        const price1mRaw = history.reduce((prev, curr) =>
+          Math.abs(curr.timestamp - oneMinAgo) < Math.abs(prev.timestamp - oneMinAgo)
+            ? curr
+            : prev,
+        );
+        if (now - price1mRaw.timestamp > 30 * 1000) {
+          change1m =
+            ((currentPrice - price1mRaw.mcSol) / price1mRaw.mcSol) * 100;
         }
 
-        // Find price closest to 5 mins ago
         const fiveMinAgo = now - 5 * 60 * 1000;
-        const price5mRaw = history.reduce((prev, curr) => Math.abs(curr.timestamp - fiveMinAgo) < Math.abs(prev.timestamp - fiveMinAgo) ? curr : prev);
-        if (now - price5mRaw.timestamp > 3 * 60 * 1000) { // Should be at least 3m away
-          change5m = ((currentPrice - price5mRaw.mcSol) / price5mRaw.mcSol) * 100;
+        const price5mRaw = history.reduce((prev, curr) =>
+          Math.abs(curr.timestamp - fiveMinAgo) < Math.abs(prev.timestamp - fiveMinAgo)
+            ? curr
+            : prev,
+        );
+        if (now - price5mRaw.timestamp > 3 * 60 * 1000) {
+          change5m =
+            ((currentPrice - price5mRaw.mcSol) / price5mRaw.mcSol) * 100;
         }
       }
 
       const useHF = selectedVoice !== "elevenlabs_default";
 
-      const res = await fetch('/api/agent/respond', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: msgToProcess.message,
-          username: msgToProcess.username,
-          bondingCurveData: stateRefs.current.bondingCurveData,
-          priceChanges: { change1m, change5m, currentMcSol: history.length > 0 ? history[history.length - 1].mcSol : null },
-          historicalPriceData: stateRefs.current.historicalPriceData,
-          streamName: stateRefs.current.streamName,
-          isBondedToken: stateRefs.current.isBondedToken,
-          solUsdPrice: stateRefs.current.solUsdPrice,
-          skipTTS: useHF
-        }),
-      });
+      const ac = new AbortController();
+      const fetchTimeoutId = window.setTimeout(
+        () => ac.abort(),
+        AGENT_FETCH_TIMEOUT_MS,
+      );
+      let res: Response;
+      try {
+        res = await fetch("/api/agent/respond", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: ac.signal,
+          body: JSON.stringify({
+            message: msgToProcess.message,
+            username: msgToProcess.username,
+            bondingCurveData: stateRefs.current.bondingCurveData,
+            priceChanges: {
+              change1m,
+              change5m,
+              currentMcSol:
+                history && history.length > 0
+                  ? history[history.length - 1].mcSol
+                  : null,
+            },
+            historicalPriceData: stateRefs.current.historicalPriceData,
+            streamName: stateRefs.current.streamName,
+            isBondedToken: stateRefs.current.isBondedToken,
+            solUsdPrice: stateRefs.current.solUsdPrice,
+            skipTTS: useHF,
+            agentMode,
+            liveTrendsDeduped: stateRefs.current.liveTrendsDeduped,
+            voteTally: stateRefs.current.voteTally,
+            voteLeader: stateRefs.current.voteLeader,
+            activeTrendSpeaking: activeSpeak,
+            recentChatTranscript: recentChatTranscript ?? undefined,
+            lastAgentSay: lastAgentSay ?? undefined,
+            varietySeed,
+          }),
+        });
+      } finally {
+        window.clearTimeout(fetchTimeoutId);
+      }
 
+      let data: {
+        text?: string;
+        audio?: string;
+        error?: string;
+        highlightTrendName?: string | null;
+        highlightTimeline?: unknown;
+      };
+      try {
+        data = await res.json();
+      } catch {
+        data = {};
+      }
       if (!res.ok) {
-        throw new Error(`API returned ${res.status}`);
+        throw new Error(
+          typeof data.error === "string"
+            ? data.error
+            : `API returned ${res.status}`,
+        );
       }
 
-      const data = await res.json();
-      setAiResponseText(data.text);
-      setAiReplies(prev => ({ ...prev, [msgToProcess.id]: data.text }));
-      
-      let audioUrl = data.audio;
-      if (useHF && data.text) {
-         try {
-           audioUrl = await generateHuggingFaceTts(
-             data.text,
-             selectedVoice,
-             "en-US-ChristopherNeural",
-             (status) => {
-               setHfStatus(status);
-             }
-           );
-         } catch (err) {
-           console.error("HF TTS Error", err);
-         } finally {
-            setHfStatus(null);
-         }
+      const replyText = data.text ?? "";
+      if (replyText.trim()) lastAgentSpokenRef.current = replyText.trim();
+      setAiReplies((prev) => ({ ...prev, [msgToProcess.id]: replyText }));
+
+      const apiHighlight =
+        typeof data.highlightTrendName === "string" &&
+        data.highlightTrendName.trim()
+          ? data.highlightTrendName.trim()
+          : null;
+      let highlightForSpeech = apiHighlight ?? activeSpeak;
+      if (!highlightForSpeech && replyText.trim()) {
+        highlightForSpeech = inferVoiceHighlightFromReply(
+          replyText,
+          stateRefs.current.liveTrendsDeduped,
+        );
       }
+      if (!highlightForSpeech && msgToProcess.message?.trim()) {
+        highlightForSpeech = inferVoiceHighlightFromReply(
+          msgToProcess.message,
+          stateRefs.current.liveTrendsDeduped,
+        );
+      }
+
+      let voiceHighlightTimeline: VoiceHighlightSegment[] = [];
+      const tlRaw = data.highlightTimeline;
+      if (Array.isArray(tlRaw)) {
+        for (const x of tlRaw) {
+          if (
+            x &&
+            typeof x === "object" &&
+            typeof (x as VoiceHighlightSegment).trendName === "string" &&
+            typeof (x as VoiceHighlightSegment).startSec === "number" &&
+            typeof (x as VoiceHighlightSegment).endSec === "number"
+          ) {
+            voiceHighlightTimeline.push({
+              trendName: (x as VoiceHighlightSegment).trendName.trim(),
+              startSec: (x as VoiceHighlightSegment).startSec,
+              endSec: (x as VoiceHighlightSegment).endSec,
+            });
+          }
+        }
+      }
+
+      setActiveTrendHighlight(null);
+      lastSyncedHighlightRef.current = null;
+      ttsHighlightScheduleRef.current = null;
+
+      let audioUrl = data.audio;
+      if (useHF && replyText) {
+        try {
+          const hfResult = await Promise.race([
+            generateHuggingFaceTts(
+              replyText,
+              selectedVoice,
+              "en-US-ChristopherNeural",
+              (status) => {
+                setHfStatus(status);
+              },
+            ),
+            new Promise<undefined>((resolve) =>
+              window.setTimeout(() => resolve(undefined), HF_TTS_TIMEOUT_MS),
+            ),
+          ]);
+          audioUrl = hfResult;
+          if (!audioUrl) {
+            setError(
+              "Hugging Face voice timed out. Try Eve (ElevenLabs) or try again.",
+            );
+          }
+        } catch (err) {
+          console.error("HF TTS Error", err);
+        } finally {
+          setHfStatus(null);
+        }
+      }
+
+      const finishSpeechUi = () => {
+        audioAnalyzerRef.current = null;
+        ttsHighlightScheduleRef.current = null;
+        lastSyncedHighlightRef.current = null;
+        setActiveTrendHighlight(null);
+        setIsPlayingTTS(false);
+        setActiveMessageId(null);
+        setHfStatus(null);
+        setAgentEphemeralRow(null);
+      };
+
+      const markAnswered = () =>
+        setMessageStatuses((prev) => ({
+          ...prev,
+          [msgToProcess.id]: "answered",
+        }));
 
       if (audioUrl) {
-        // Play through Web Audio API so visualizer can read real-time frequency data
-        try {
-          const ctx = audioContextRef.current ?? new (window.AudioContext || (window as any).webkitAudioContext)();
-          if (!audioContextRef.current) audioContextRef.current = ctx;
-          if (ctx.state === "suspended") await ctx.resume();
+        const trends = stateRefs.current.liveTrendsDeduped;
+        const resolveTrendCanon = (raw: string) => {
+          const r = raw.trim();
+          for (const t of trends) {
+            if (trendDisplayNamesMatch(r, t.trend_name)) return t.trend_name;
+          }
+          return null;
+        };
 
-          const res = await fetch(audioUrl);
-          const arrayBuffer = await res.arrayBuffer();
-          const buffer = await ctx.decodeAudioData(arrayBuffer);
+        const AC =
+          window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        if (!audioContextRef.current) {
+          audioContextRef.current = new AC();
+        }
+        const ctx = audioContextRef.current;
+        await ctx.resume().catch(() => {});
 
-          const source = ctx.createBufferSource();
-          source.buffer = buffer;
+        let safetyId: number | null = null;
+        const disarmSafety = () => {
+          if (safetyId != null) {
+            window.clearTimeout(safetyId);
+            safetyId = null;
+          }
+        };
+        const armSafety = (ms: number) => {
+          disarmSafety();
+          safetyId = window.setTimeout(() => {
+            safetyId = null;
+            finishSpeechUi();
+          }, ms);
+        };
 
-          const analyser = ctx.createAnalyser();
-          analyser.fftSize = 512;
-          analyser.smoothingTimeConstant = 0.7;
-          analyser.minDecibels = -75;
-          analyser.maxDecibels = -5;
+        /** HTML audio: resume context after `play()` + retry binding — MediaElementSource often only works once ctx is running. */
+        const bindHtmlAudioForVisualizer = (audio: HTMLAudioElement) => {
+          const tryBind = async () => {
+            await ensureAudioContextRunning(ctx, 1500);
+            if (audioAnalyzerRef.current) return;
+            if (String(ctx.state) === "running") {
+              tryAttachMediaElementVisualizer(audio, ctx, audioAnalyzerRef);
+            }
+          };
+          const onPlaying = () => {
+            void tryBind();
+            const started = performance.now();
+            const id = window.setInterval(() => {
+              if (audioAnalyzerRef.current || performance.now() - started > 4500) {
+                window.clearInterval(id);
+                return;
+              }
+              void tryBind();
+            }, 80);
+          };
+          audio.addEventListener("playing", onPlaying, { once: true });
+          return tryBind;
+        };
 
-          source.connect(analyser);
-          analyser.connect(ctx.destination);
+        await ensureAudioContextRunning(ctx, 500);
 
-          const dataArray = new Uint8Array(analyser.frequencyBinCount);
-          audioAnalyzerRef.current = { analyser, data: dataArray };
+        let audioBuffer: AudioBuffer | null = null;
+        if (ctx.state === "running") {
+          try {
+            const audioFetch = await fetch(audioUrl);
+            const arrayBuffer = await audioFetch.arrayBuffer();
+            audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+          } catch {
+            audioBuffer = null;
+          }
+        }
 
-          source.start(0);
-          source.onended = () => {
+        let playedWithBuffer = false;
+        if (audioBuffer && ctx.state === "running") {
+          try {
+            let timeline = voiceHighlightTimeline;
+            if (timeline.length === 0 && replyText.trim() && trends.length > 0) {
+              timeline = buildProportionalHighlightTimeline(
+                replyText,
+                trends.map((t) => t.trend_name),
+                audioBuffer.duration,
+                VOICE_HIGHLIGHT_LINGER_SEC,
+                (raw) => resolveTrendCanon(raw) ?? raw,
+              );
+            }
+
+            const source = ctx.createBufferSource();
+            source.buffer = audioBuffer;
+
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 1024;
+            analyser.smoothingTimeConstant = 0.45;
+            analyser.minDecibels = -100;
+            analyser.maxDecibels = -20;
+
+            source.connect(analyser);
+            analyser.connect(ctx.destination);
+
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            audioAnalyzerRef.current = { analyser, data: dataArray };
+
+            const safetyMs = Math.min(
+              240_000,
+              Math.max(8_000, (audioBuffer.duration + 3) * 1000),
+            );
+            armSafety(safetyMs);
+            source.onended = () => {
+              disarmSafety();
+              finishSpeechUi();
+            };
+            const tWhen = ctx.currentTime;
+            source.start(tWhen);
+            ttsHighlightScheduleRef.current = {
+              segments: timeline,
+              mode: "buffer",
+              bufferCtxStartTime: tWhen,
+              htmlAudio: null,
+            };
+            markAnswered();
+            playedWithBuffer = true;
+          } catch (err) {
+            console.warn("Web Audio buffer playback failed, falling back to HTML Audio", err);
             audioAnalyzerRef.current = null;
-            setIsPlayingTTS(false);
-            setActiveMessageId(null);
-            setAiResponseText(null);
-            setHfStatus(null);
-          };
-          setMessageStatuses(prev => ({ ...prev, [msgToProcess.id]: 'answered' }));
-        } catch (err) {
-          console.warn("Web Audio playback failed, falling back to HTML Audio", err);
-          audioAnalyzerRef.current = null;
+          }
+        }
+
+        if (!playedWithBuffer) {
           const audio = new Audio(audioUrl);
+          armSafety(240_000);
           audio.onended = () => {
-            setIsPlayingTTS(false);
-            setActiveMessageId(null);
-            setAiResponseText(null);
-            setHfStatus(null);
+            disarmSafety();
+            finishSpeechUi();
           };
-          await audio.play();
-          setMessageStatuses(prev => ({ ...prev, [msgToProcess.id]: 'answered' }));
+          let htmlTimeline = voiceHighlightTimeline;
+          if (htmlTimeline.length === 0 && replyText.trim() && trends.length > 0) {
+            const durGuess = Math.min(
+              120,
+              Math.max(5, replyText.length * 0.052),
+            );
+            htmlTimeline = buildProportionalHighlightTimeline(
+              replyText,
+              trends.map((t) => t.trend_name),
+              durGuess,
+              VOICE_HIGHLIGHT_LINGER_SEC,
+              (raw) => resolveTrendCanon(raw) ?? raw,
+            );
+          }
+          ttsHighlightScheduleRef.current = {
+            segments: htmlTimeline,
+            mode: "html",
+            bufferCtxStartTime: null,
+            htmlAudio: audio,
+          };
+          const tryBindHtml = bindHtmlAudioForVisualizer(audio);
+          try {
+            await tryBindHtml();
+            await audio.play();
+            markAnswered();
+          } catch (playErr) {
+            disarmSafety();
+            console.warn("HTML Audio playback failed", playErr);
+            setIsPlayingTTS(false);
+            setHfStatus(null);
+            setActiveTrendHighlight(null);
+            setAgentEphemeralRow(null);
+            setError(
+              "Voice was blocked or unsupported. Click Start Agent (or interact with the page) so the browser can unlock audio.",
+            );
+            markAnswered();
+          }
         }
       } else {
-        // Fallback if no audio was generated
+        if (highlightForSpeech) setActiveTrendHighlight(highlightForSpeech);
         setTimeout(() => {
+          setActiveTrendHighlight(null);
           setIsPlayingTTS(false);
           setActiveMessageId(null);
-          setAiResponseText(null);
           setHfStatus(null);
+          setAgentEphemeralRow(null);
         }, 6000);
-        setMessageStatuses(prev => ({ ...prev, [msgToProcess.id]: 'answered' }));
+        setMessageStatuses((prev) => ({
+          ...prev,
+          [msgToProcess.id]: "answered",
+        }));
       }
     } catch (error) {
       console.error("Agent interaction failed", error);
-      // Mark as answered or error so the UI can move on from the loading state
-      setMessageStatuses(prev => ({ ...prev, [msgToProcess.id]: 'answered' }));
-      
-      // If we had text but audio failed, we should still show the text for a bit
+      ttsHighlightScheduleRef.current = null;
+      lastSyncedHighlightRef.current = null;
+      setActiveTrendHighlight(null);
+      const msg =
+        error instanceof Error && error.name === "AbortError"
+          ? "Agent request timed out. Check your connection and try again."
+          : error instanceof Error
+            ? error.message
+            : "Agent request failed";
+      setError(msg);
+      setMessageStatuses((prev) => ({
+        ...prev,
+        [msgToProcess.id]: "answered",
+      }));
+
       setTimeout(() => {
-         setIsPlayingTTS(false);
-         setActiveMessageId(null);
-         setAiResponseText(null);
-         setHfStatus(null);
+        setIsPlayingTTS(false);
+        setActiveMessageId(null);
+        setHfStatus(null);
+        setAgentEphemeralRow(null);
       }, 3000);
     }
-  };
+  },
+  [selectedVoice],
+);
+
+  useEffect(() => {
+    triggerAgentRef.current = triggerAgent;
+  }, [triggerAgent]);
+
+  /** Last-resort reset if a run hangs without ever calling finishSpeechUi. */
+  useEffect(() => {
+    if (!isPlayingTTS) return;
+    const id = window.setTimeout(() => {
+      console.warn(
+        "[Eve] TTS watchdog: resetting stuck playback state after",
+        TTS_STUCK_WATCHDOG_MS,
+        "ms",
+      );
+      audioAnalyzerRef.current = null;
+      ttsHighlightScheduleRef.current = null;
+      lastSyncedHighlightRef.current = null;
+      setIsPlayingTTS(false);
+      setActiveMessageId(null);
+      setHfStatus(null);
+      setActiveTrendHighlight(null);
+      setAgentEphemeralRow(null);
+    }, TTS_STUCK_WATCHDOG_MS);
+    return () => window.clearTimeout(id);
+  }, [isPlayingTTS]);
+
+  useEffect(() => {
+    if (!isConnected) return;
+    const id = window.setInterval(() => {
+      if (stateRefs.current.isPlayingTTS) return;
+      const d = dedupedRef.current;
+      if (!d.length) return;
+      const now = Date.now();
+      const g = trendTickGuardRef.current;
+      const top = d[0];
+      if (!g.seeded) {
+        g.lastTop = top.trend_name;
+        g.lastHeat = top.maxHeat;
+        g.seeded = true;
+        return;
+      }
+      if (now - g.lastTickAt < TREND_TICK_MIN_MS) {
+        g.lastHeat = top.maxHeat;
+        g.lastTop = top.trend_name;
+        return;
+      }
+      const changed = top.trend_name !== g.lastTop;
+      const jumped = g.lastHeat > 5 && top.maxHeat > g.lastHeat * 1.35;
+      g.lastHeat = top.maxHeat;
+      g.lastTop = top.trend_name;
+      if (!changed && !jumped) return;
+      g.lastTickAt = now;
+      void triggerAgentRef.current(
+        syntheticAgentMessage({
+          id: `trend-tick-${now}`,
+          message: `Voice cue: spotlighting “${top.trend_name}” on the radar.`,
+          username: "TrendRadar",
+        }),
+        { agentMode: "trend_tick", activeTrendSpeaking: top.trend_name },
+      );
+    }, 60_000);
+    return () => window.clearInterval(id);
+  }, [isConnected]);
+
+  useEffect(() => {
+    if (!isConnected) return;
+    const id = window.setInterval(() => {
+      if (stateRefs.current.isPlayingTTS) return;
+      const d = dedupedRef.current;
+      if (!d.length) return;
+      const now = Date.now();
+      const silence = now - lastRealChatAtRef.current;
+      let minGap = 50_000;
+      if (silence > 5 * 60 * 1000) minGap = 90_000;
+      if (silence > 12 * 60 * 1000) minGap = 4 * 60 * 1000;
+
+      if (now - hostBanterGuardRef.current.lastAt < minGap) return;
+
+      void triggerAgentRef.current(
+        syntheticAgentMessage({
+          id: `host-banter-${now}`,
+          message:
+            "Voice cue: host energy — keeping momentum while chat is quiet.",
+          username: "HostFill",
+        }),
+        { agentMode: "host_banter", activeTrendSpeaking: null },
+      );
+    }, HOST_BANTER_CHECK_MS);
+    return () => window.clearInterval(id);
+  }, [isConnected]);
+
+  useEffect(() => {
+    for (const [name, n] of Object.entries(voteTally)) {
+      if (n >= voteGoal && !winnerAnnouncedRef.current) {
+        winnerAnnouncedRef.current = true;
+        setWinningTrend(name);
+        void triggerAgentRef.current(
+          syntheticAgentMessage({
+            id: `winner-${Date.now()}`,
+            message: `[Stream: "${name}" hit ${voteGoal} votes and wins this voting round. Celebrate the pick and hype the room in two short sentences.]`,
+            username: "VoteBooth",
+          }),
+          { agentMode: "chat_reply", activeTrendSpeaking: name },
+        );
+        break;
+      }
+    }
+  }, [voteTally, voteGoal]);
+
+  useEffect(() => {
+    if (!isConnected || !voteLeader) return;
+    const total = Object.values(voteTally).reduce((s, x) => s + x, 0);
+    if (total < 3) return;
+    const prev = voteLeaderPrevRef.current;
+    if (prev === voteLeader) return;
+    if (prev !== null) {
+      const now = Date.now();
+      if (
+        now - lastVoteSummaryAtRef.current >= VOTE_SUMMARY_COOLDOWN_MS &&
+        !stateRefs.current.isPlayingTTS
+      ) {
+        lastVoteSummaryAtRef.current = now;
+        void triggerAgentRef.current(
+          syntheticAgentMessage({
+            id: `vote-sum-${now}`,
+            message: "Voice cue: vote standings update.",
+            username: "VoteBooth",
+          }),
+          { agentMode: "vote_summary" },
+        );
+      }
+    }
+    voteLeaderPrevRef.current = voteLeader;
+  }, [voteLeader, voteTally, isConnected]);
 
   useEffect(() => {
     if (!isConnected) return;
 
     const interval = setInterval(async () => {
-      const { messages: currentMessages, messageStatuses: currentStatuses, isPlayingTTS: currentPlayingTTS } = stateRefs.current;
+      const {
+        messages: currentMessages,
+        messageStatuses: currentStatuses,
+        isPlayingTTS: currentPlayingTTS,
+      } = stateRefs.current;
 
-      if (currentPlayingTTS) return; // Don't interrupt if already processing
+      if (currentPlayingTTS) return;
       if (currentMessages.length === 0) return;
-      
-      // Look for recent messages (only the last 2 to prevent answering old backlog)
-      const recentMessages = currentMessages.slice(-2);
-      
-      // Filter out messages that are already processing/answered, or too short/junk
-      const validMessages = recentMessages.filter(msg => {
-        const isHandled = currentStatuses[msg.id];
-        const isTooShort = msg.message.trim().length <= 3;
-        // Basic junk filters (can be expanded later)
-        const isJunk = /^(lfg|gm|gn|wow|lol|lmao)$/i.test(msg.message.trim());
-        
-        return !isHandled && !isTooShort && !isJunk;
-      });
 
-      if (validMessages.length > 0) {
-        // ALWAYS pick the LAST valid message instead of a random one
-        const msgToProcess = validMessages[validMessages.length - 1];
+      const useWideCatchUp = catchUpPollAfterConnectRef.current;
+      if (useWideCatchUp) {
+        catchUpPollAfterConnectRef.current = false;
+      }
+      const lookback = useWideCatchUp
+        ? AGENT_CATCH_UP_LOOKBACK
+        : AGENT_POLL_TAIL;
+
+      const msgToProcess = findLatestUnansweredChatMessage(
+        currentMessages,
+        currentStatuses,
+        lookback,
+      );
+      if (msgToProcess) {
         triggerAgent(msgToProcess);
       }
-    }, 1000); // Check every 1 second to make response immediate
+    }, 1000);
 
     return () => clearInterval(interval);
-  }, [isConnected]);
+  }, [isConnected, triggerAgent]);
 
   // Auto-scroll to the bottom of the chat
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, aiReplies]);
+  }, [chatListMessages, aiReplies]);
 
-  const handleConnect = async (isReconnect = false) => {
-    // Unlock Audio Context on user interaction to prevent Autoplay blocks
-    try {
-      const unlockAudio = new Audio("data:audio/mp3;base64,//OwgAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAACcQCAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA//////////////////////////////////////////////////////////////////8AAABhTEFNRTMuMTAwA8EAAAAAAAAAABRAJAICAQAAwYAAAnGQb1MAAAAAAAAAAAAAAAAAAAAA");
-      unlockAudio.volume = 0.01;
-      unlockAudio.play().catch(e => console.warn("Audio unlock failed:", e));
-    } catch(e) {}
+  const handleConnect = async (
+    isReconnect = false,
+    connectOpts?: { fromUserClick?: boolean },
+  ) => {
+    if (connectOpts?.fromUserClick) {
+      await primeWebAudioContext(audioContextRef);
+    }
 
     if (!addressInput.trim()) {
       setError("Please enter a token address or URL");
@@ -976,9 +1603,15 @@ export default function PumpfunChatPage({
       reconnectTimeoutRef.current = null;
     }
 
+    if (connectHandshakeTimerRef.current != null) {
+      window.clearTimeout(connectHandshakeTimerRef.current);
+      connectHandshakeTimerRef.current = null;
+    }
+
     try {
       setIsConnecting(true);
       setError(null);
+      setConnectionNotice(null);
       // Only clear messages if we are not actively attempting to reconnect (i.e. if it's a fresh manual connection)
       // Since handleConnect clears history, we should avoid wiping during auto-reconnect, but for now it's fine
       // because `messages` are already wiped on fresh start. Wait, doing this will wipe the UI every time it reconnects!
@@ -988,10 +1621,13 @@ export default function PumpfunChatPage({
       
       if (!isReconnect) {
         setMessages([]);
+        catchUpPollAfterConnectRef.current = true;
         // Optional: you could clear manual metadata here, but likely user wants to keep it
         // setStreamName("");
         // setStreamSymbol("");
         // setStreamDescription("");
+      } else {
+        catchUpPollAfterConnectRef.current = false;
       }
       // We purposefully DO NOT wipe messageStatuses so they accumulate across reconnects
 
@@ -1010,14 +1646,41 @@ export default function PumpfunChatPage({
         `/api/pumpchat?roomId=${encodeURIComponent(roomId)}&username=${encodeURIComponent(username.trim() || "Anonymous AI Developer")}`
       );
 
+      const clearConnectHandshakeTimer = () => {
+        if (connectHandshakeTimerRef.current != null) {
+          window.clearTimeout(connectHandshakeTimerRef.current);
+          connectHandshakeTimerRef.current = null;
+        }
+      };
+
+      connectHandshakeTimerRef.current = window.setTimeout(() => {
+        connectHandshakeTimerRef.current = null;
+        if (clientRef.current !== client) return;
+        clientRef.current = null;
+        try {
+          client.close();
+        } catch {
+          /* ignore */
+        }
+        setIsConnecting(false);
+        setIsConnected(false);
+        setError(
+          "Chat stream did not respond in time. Check the token or room ID and press Start Agent again.",
+        );
+        setConnectionNotice(null);
+      }, 25_000);
+
       client.onmessage = (event) => {
         try {
           const parsed = JSON.parse(event.data);
           if (parsed.type === 'connected') {
+            clearConnectHandshakeTimer();
             setIsConnected(true);
             setIsConnecting(false);
             setError(null);
+            setConnectionNotice(null);
           } else if (parsed.type === 'messageHistory') {
+            clearConnectHandshakeTimer();
             setMessages((prev) => {
               if (!isReconnect || prev.length === 0) return parsed.data || [];
               const existingIds = new Set(prev.map(m => m.id));
@@ -1027,17 +1690,38 @@ export default function PumpfunChatPage({
               return combined;
             });
             // Allowed historical messages to be picked up by AI analysis
-          } else if (parsed.type === 'message') {
+          } else if (parsed.type === "message") {
+            clearConnectHandshakeTimer();
+            const msg = parsed.data as IMessage;
+            if (isVoteOnlyMessage(msg.message)) {
+              const v = parseChatVote(msg.message, voteOptionsRef.current);
+              if (v) {
+                const uid = (msg.username || "anon").toLowerCase();
+                const now = Date.now();
+                if (
+                  now - (voteCooldownRef.current[uid] ?? 0) >=
+                  VOTE_COOLDOWN_MS
+                ) {
+                  voteCooldownRef.current[uid] = now;
+                  setVoteTally((vt) => ({
+                    ...vt,
+                    [v.key]: (vt[v.key] ?? 0) + 1,
+                  }));
+                }
+              }
+            }
             setMessages((prev) => {
-              // Avoid duplicates if SSE reconnects and sends history
-              if (parsed.data.id && prev.some(m => m.id === parsed.data.id)) return prev;
-              const newMessages = [...prev, parsed.data];
+              if (msg.id && prev.some((m) => m.id === msg.id)) return prev;
+              const newMessages = [...prev, msg];
               if (newMessages.length > 100) return newMessages.slice(-100);
               return newMessages;
             });
           } else if (parsed.type === 'error') {
+            clearConnectHandshakeTimer();
             console.error("Chat error:", parsed.data);
-            setError(`Connection error: ${parsed.data}. Reconnecting in 3s...`);
+            setConnectionNotice(
+              `Connection error: ${parsed.data}. Reconnecting in 3s…`,
+            );
             setIsConnected(false);
             setIsConnecting(true);
             client.close();
@@ -1045,9 +1729,10 @@ export default function PumpfunChatPage({
               handleConnect(true);
             }, 3000);
           } else if (parsed.type === 'disconnected') {
+            clearConnectHandshakeTimer();
             setIsConnected(false);
             setIsConnecting(true); // Indicate reconnecting
-            setError("Server disconnected. Reconnecting in 3s...");
+            setConnectionNotice("Server disconnected. Reconnecting in 3s…");
             client.close();
             reconnectTimeoutRef.current = setTimeout(() => {
               handleConnect(true);
@@ -1059,8 +1744,9 @@ export default function PumpfunChatPage({
       };
 
       client.onerror = (err) => {
+        clearConnectHandshakeTimer();
         console.error("SSE Error:", err);
-        setError("Lost connection to chat server. Reconnecting in 3s...");
+        setConnectionNotice("Lost connection to chat server. Reconnecting in 3s…");
         setIsConnected(false);
         setIsConnecting(true);
         client.close();
@@ -1071,6 +1757,10 @@ export default function PumpfunChatPage({
 
       clientRef.current = client;
     } catch (err: any) {
+      if (connectHandshakeTimerRef.current != null) {
+        window.clearTimeout(connectHandshakeTimerRef.current);
+        connectHandshakeTimerRef.current = null;
+      }
       setError(err.message || "Failed to initialize client");
       setIsConnecting(false);
     }
@@ -1090,6 +1780,10 @@ export default function PumpfunChatPage({
   }, [addressInput, autoConnect]);
 
   const handleDisconnect = () => {
+    if (connectHandshakeTimerRef.current != null) {
+      window.clearTimeout(connectHandshakeTimerRef.current);
+      connectHandshakeTimerRef.current = null;
+    }
     if (clientRef.current) {
       clientRef.current.close();
       clientRef.current = null;
@@ -1098,18 +1792,37 @@ export default function PumpfunChatPage({
       clearTimeout(reconnectTimeoutRef.current);
       reconnectTimeoutRef.current = null;
     }
+    setAgentEphemeralRow(null);
     audioAnalyzerRef.current = null;
     setIsConnected(false);
     setIsConnecting(false);
     setMessages([]);
     setIsPlayingTTS(false);
     setActiveMessageId(null);
-    setAiResponseText(null);
+    setHfStatus(null);
     setStreamName("");
     setStreamSymbol("");
     setIsBondedToken(false);
     setPriceHistory([]);
     setHistoricalPriceData(null);
+    setVoteTally({});
+    voteCooldownRef.current = {};
+    setWinningTrend(null);
+    winnerAnnouncedRef.current = false;
+    voteLeaderPrevRef.current = null;
+    trendTickGuardRef.current = {
+      lastTop: null,
+      lastHeat: 0,
+      lastTickAt: 0,
+      seeded: false,
+    };
+    ttsHighlightScheduleRef.current = null;
+    lastSyncedHighlightRef.current = null;
+    setActiveTrendHighlight(null);
+    setError(null);
+    setConnectionNotice(null);
+    lastAgentSpokenRef.current = null;
+    varietySeedRef.current = 0;
     // messageStatuses and aiReplies intentionally kept to persist data
   };
 
@@ -1139,15 +1852,76 @@ export default function PumpfunChatPage({
 
       <div className="relative z-10 flex flex-1 min-h-0 flex-col pb-[3.25rem] sm:pb-14">
       {/* Compact header: branding + connect inline, gradient accent line */}
-      <header className="relative z-20 flex items-center justify-between gap-4 px-4 sm:px-6 lg:px-8 py-3 bg-black/30 backdrop-blur-xl shrink-0">
+      <header className="relative z-20 flex items-center gap-3 sm:gap-4 px-4 sm:px-6 lg:px-8 py-3 bg-black/30 backdrop-blur-xl shrink-0 min-h-[3.25rem]">
         <div className="absolute bottom-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-cyan-500/40 to-fuchsia-500/40" aria-hidden />
-        <div className="flex items-center gap-3 min-w-0">
+        <div className="flex items-center gap-3 min-w-0 flex-1">
           <img src="/clawk.png" alt="EVE" className="w-10 h-10 rounded-xl object-contain bg-white/5 flex-shrink-0 ring-1 ring-white/10 shadow-sm" />
-          <h1 className="text-xl sm:text-2xl font-black tracking-tight truncate">
-            <span className="bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">EVE</span>
-            <span className="text-cyan-400 ml-1.5 font-semibold">Pump Assistant</span>
-          </h1>
+          <div className="min-w-0 flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-3">
+            <h1 className="text-xl sm:text-2xl font-black tracking-tight truncate">
+              <span className="bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">EVE</span>
+              <span className="text-cyan-400 ml-1.5 font-semibold">Trend Analyst</span>
+            </h1>
+            {(isBondedToken || (latestMcSol !== null && latestMcSol > 0)) && (
+              <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 sm:pl-3 sm:border-l border-white/10 text-[11px] sm:text-xs">
+                {isBondedToken && (
+                  <span className="font-mono text-cyan-400 uppercase tracking-wider font-semibold shrink-0">Bonded</span>
+                )}
+                {latestMcSol !== null && latestMcSol > 0 && (
+                  <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0">
+                    <span className="text-[10px] font-mono text-gray-500 uppercase tracking-wider">Market Cap</span>
+                    <span className="font-bold tabular-nums text-white">{latestMcSol.toFixed(2)} SOL</span>
+                    {solUsdPrice != null && (
+                      <span className="text-green-400 font-mono tabular-nums">
+                        ${(latestMcSol * solUsdPrice).toLocaleString("en-US", { maximumFractionDigits: 0 })}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
+        {mcChartMounted && priceHistory.length > 1 && (
+          <div className="hidden sm:flex flex-col justify-end shrink-0 w-36 h-[52px] border-l border-white/10 pl-3 ml-0.5">
+            <p className="text-[9px] font-mono text-gray-500 uppercase tracking-widest mb-0.5 text-right leading-none">
+              MC (SOL)
+            </p>
+            <div className="h-10 w-full min-h-0">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={priceHistory} margin={{ top: 2, right: 0, left: 0, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="mcGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#00f5ff" stopOpacity={0.35} />
+                      <stop offset="95%" stopColor="#00f5ff" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <YAxis domain={mcChartYDomain ?? ["auto", "auto"]} hide />
+                  <Tooltip
+                    contentStyle={{
+                      background: "rgba(0,0,0,0.7)",
+                      border: "1px solid #00f5ff33",
+                      borderRadius: 4,
+                      fontSize: 10,
+                      padding: "2px 6px",
+                    }}
+                    itemStyle={{ color: "#00f5ff" }}
+                    formatter={(v: any) => [`${Number(v).toFixed(3)} SOL`, ""]}
+                    labelFormatter={() => ""}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="mcSol"
+                    stroke="#00f5ff"
+                    strokeWidth={1.5}
+                    fill="url(#mcGrad)"
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        )}
         <div className="flex items-center gap-2 sm:gap-3 flex-shrink-0">
           <div className="hidden sm:flex items-center gap-2">
             <select
@@ -1209,7 +1983,7 @@ export default function PumpfunChatPage({
           )}
           {!isConnected ? (
             <button
-              onClick={() => handleConnect(false)}
+              onClick={() => handleConnect(false, { fromUserClick: true })}
               disabled={isConnecting}
               className="relative py-2.5 px-5 sm:px-6 bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 rounded-xl font-semibold text-white transition-all duration-200 flex items-center justify-center gap-2 overflow-hidden border border-cyan-400/40 hover:border-cyan-300/60 active:scale-[0.98]"
             >
@@ -1272,119 +2046,165 @@ export default function PumpfunChatPage({
         <div className="flex-1 min-w-0 flex flex-col relative overflow-hidden border-r border-white/5">
           <div className="absolute inset-0 bg-gradient-to-br from-cyan-950/20 via-black/40 to-fuchsia-950/10" />
           <div className="absolute right-0 top-0 bottom-0 w-px bg-gradient-to-b from-transparent via-cyan-500/20 to-transparent pointer-events-none" aria-hidden />
-          {/* Overlay bar: token name and ticker only (Pending % and MC moved to visualizer center) */}
-          <div className="relative z-10 flex items-center gap-4 px-4 sm:px-6 lg:px-8 py-3 flex-wrap">
-            <input
-              type="text"
-              placeholder="Token name"
-              value={streamName}
-              onChange={e => setStreamName(e.target.value)}
-              className="bg-transparent text-lg sm:text-xl font-bold text-white placeholder:text-gray-500 border-b border-transparent hover:border-white/20 focus:border-cyan-500/60 focus:outline-none transition-colors w-32 sm:w-44"
-            />
-            <span className="text-sm px-2 py-1 bg-white/10 text-gray-300 rounded font-mono">
-              $ <input
+          {/* Overlay bar: token name, ticker, and connection status (inline so radar height is stable) */}
+          <div className="relative z-10 flex items-center gap-3 sm:gap-4 px-4 sm:px-6 lg:px-8 py-3 min-h-[3rem]">
+            <div className="flex items-center gap-3 sm:gap-4 flex-shrink-0 flex-wrap">
+              <input
                 type="text"
-                placeholder="TICKER"
-                value={streamSymbol}
-                onChange={e => setStreamSymbol(e.target.value.toUpperCase())}
-                className="bg-transparent w-16 sm:w-20 focus:outline-none placeholder:text-gray-500 font-mono"
+                placeholder="Token name"
+                value={streamName}
+                onChange={e => setStreamName(e.target.value)}
+                className="bg-transparent text-lg sm:text-xl font-bold text-white placeholder:text-gray-500 border-b border-transparent hover:border-white/20 focus:border-cyan-500/60 focus:outline-none transition-colors w-32 sm:w-44"
               />
-            </span>
+              <span className="text-sm px-2 py-1 bg-white/10 text-gray-300 rounded font-mono">
+                $ <input
+                  type="text"
+                  placeholder="TICKER"
+                  value={streamSymbol}
+                  onChange={e => setStreamSymbol(e.target.value.toUpperCase())}
+                  className="bg-transparent w-16 sm:w-20 focus:outline-none placeholder:text-gray-500 font-mono"
+                />
+              </span>
+            </div>
+            <div className="flex-1 min-w-0 flex items-center justify-end self-center">
+              {connectionNotice ? (
+                <span
+                  className="text-xs sm:text-sm text-amber-400/95 tabular-nums text-right truncate max-w-full"
+                  title={connectionNotice}
+                >
+                  {connectionNotice}
+                </span>
+              ) : null}
+            </div>
           </div>
 
-          {/* Visualizer + status - centered, fills space */}
-          <div className="flex-1 flex flex-col items-center justify-center relative z-10 px-4 py-6 min-h-0">
-            {/* Mini price chart in top-right of center area */}
-          {priceHistory.length > 1 && (
-            <div className="absolute top-3 right-3 w-36 h-16 z-20 pointer-events-none">
-              <p className="text-[9px] font-mono text-gray-500 uppercase tracking-widest mb-0.5 text-right">MC (SOL)</p>
-              <ResponsiveContainer width="100%" height="80%">
-                <AreaChart data={priceHistory} margin={{ top: 2, right: 0, left: 0, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="mcGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#00f5ff" stopOpacity={0.35} />
-                      <stop offset="95%" stopColor="#00f5ff" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <YAxis
-                    domain={mcChartYDomain ?? ["auto", "auto"]}
-                    hide
+          <div className="flex-1 flex flex-col min-h-0 overflow-y-auto overflow-x-hidden relative z-10">
+            <div className="flex-1 min-h-0 flex flex-col px-2 sm:px-3 pt-1 pb-1 lg:pt-0">
+              <div className="flex-1 min-h-0 flex flex-col lg:flex-row lg:items-stretch gap-3 min-h-0">
+                <TrendHeatLeaderboard
+                  polar={trendPolarData}
+                  activeTrendName={activeTrendHighlight}
+                  className="max-h-[min(38vh,340px)] lg:max-h-none lg:h-full lg:min-h-0 lg:w-[min(100%,320px)] lg:shrink-0"
+                />
+                <div className="flex-1 min-h-0 min-w-0 flex flex-col min-h-[240px] lg:min-h-0">
+                  <TrendRadarChart
+                    polar={trendPolarData}
+                    activeTrendName={activeTrendHighlight}
+                    speechPulse={speechPulse}
+                    voice={{
+                      audioAnalyzerRef,
+                      isPlayingTTS,
+                      progressNorm: radarVoiceBonding.progressNorm,
+                    }}
+                    bondingHud={
+                      <>
+                        {!radarVoiceBonding.bondingHasData &&
+                        latestMcSol === null ? (
+                          <span className="block text-cyan-400/90 leading-tight">
+                            Connect a token
+                          </span>
+                        ) : null}
+                        {radarVoiceBonding.bondingHasData &&
+                        radarVoiceBonding.progress !== null &&
+                        radarVoiceBonding.progress < 100 &&
+                        bondingCurveData?.realTokenReserves != null ? (
+                          <span className="block font-mono text-fuchsia-200/90 leading-tight">
+                            Pending{" "}
+                            {(() => {
+                              const currentTokens = BigInt(
+                                bondingCurveData.realTokenReserves,
+                              );
+                              const initialTokens = BigInt("793100000000000");
+                              return `${(Number((currentTokens * BigInt("10000")) / initialTokens) / 100).toFixed(1)}%`;
+                            })()}
+                          </span>
+                        ) : null}
+                      </>
+                    }
                   />
-                  <Tooltip
-                    contentStyle={{ background: 'rgba(0,0,0,0.7)', border: '1px solid #00f5ff33', borderRadius: 4, fontSize: 10, padding: '2px 6px' }}
-                    itemStyle={{ color: '#00f5ff' }}
-                    formatter={(v: any) => [`${Number(v).toFixed(3)} SOL`, '']}
-                    labelFormatter={() => ''}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="mcSol"
-                    stroke="#00f5ff"
-                    strokeWidth={1.5}
-                    fill="url(#mcGrad)"
-                    dot={false}
-                    isAnimationActive={false}
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
+                </div>
+              </div>
+              {trendsError && (
+                <p className="text-[10px] text-red-400/90 mt-1 px-1 shrink-0">{trendsError}</p>
+              )}
+              {trendsFetchedAt && !trendsError && (
+                <p className="text-[9px] text-zinc-600 mt-0.5 px-1 font-mono shrink-0">
+                  Updated{" "}
+                  {new Date(trendsFetchedAt).toLocaleTimeString("en-US", {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    second: "2-digit",
+                    hour12: true,
+                  })}
+                </p>
+              )}
             </div>
-          )}
-          <BondingCurveVisualizer
-              bondingCurveData={bondingCurveData}
-              isBondedToken={isBondedToken}
-              currentMcSol={priceHistory.length > 0 ? priceHistory[priceHistory.length - 1].mcSol : null}
-              solUsdPrice={solUsdPrice}
-              isPlayingTTS={isPlayingTTS}
-              audioAnalyzerRef={audioAnalyzerRef}
-              priceHistory={priceHistory}
-            />
-            <div className="h-20 flex flex-col items-center justify-center mt-2">
-              <AnimatePresence mode="wait">
-                {isPlayingTTS && activeMessageId ? (
-                  <motion.div
-                    key="speaking"
-                    initial={{ opacity: 0, y: 8 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -8 }}
-                    className="text-center"
-                  >
-                    <p className="text-lg sm:text-xl font-medium flex items-center gap-2 justify-center bg-gradient-to-r from-white via-cyan-100 to-fuchsia-200 bg-clip-text text-transparent">
-                      <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping flex-shrink-0" />
-                      {aiResponseText ? "Speaking…" : "Generating…"}
-                    </p>
-                    <p className="text-gray-400 text-sm max-w-md mx-auto mt-1 italic line-clamp-2">
-                      "{messages.find(m => m.id === activeMessageId)?.message || "..."}"
-                    </p>
-                    {aiResponseText && (
-                      <p className="text-cyan-200/90 text-sm sm:text-base max-w-md mx-auto mt-2 font-medium">
-                        "{aiResponseText}"
-                      </p>
-                    )}
-                    {hfStatus && (
-                      <div className="flex items-center justify-center gap-2 mt-3 text-xs font-mono bg-fuchsia-900/30 text-fuchsia-200 border border-fuchsia-500/20 py-1.5 px-3 rounded-full mx-auto w-max max-w-full">
-                         <Loader2 className="w-3 h-3 animate-spin text-fuchsia-400" />
-                         {hfStatus.stage === "pending" && (
-                           <span>Queued in HF Space... {hfStatus.position ? `Pos: ${hfStatus.position}` : ''}</span>
-                         )}
-                         {hfStatus.stage === "generating" && (
-                           <span>Generating Voice... {hfStatus.eta ? `ETA: ${hfStatus.eta}s` : ''}</span>
-                         )}
-                      </div>
-                    )}
-                  </motion.div>
+
+            {winningTrend && (
+              <div className="mx-2 mb-2 px-3 py-2 rounded-lg bg-fuchsia-500/20 border border-fuchsia-500/40 text-fuchsia-100 text-xs font-semibold text-center">
+                Vote winner: {winningTrend}
+              </div>
+            )}
+
+            <div className="shrink-0 px-3 py-2 border-y border-white/5 space-y-1.5 bg-black/20">
+              <p className="text-[9px] font-mono text-zinc-500 uppercase tracking-wider">
+                Chat votes · !vote 1–{Math.min(20, liveTrendsDeduped.length) || "N"} · !pick name
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {top3Votes.length === 0 ? (
+                  <span className="text-[10px] text-zinc-500">No votes yet</span>
                 ) : (
-                  <motion.p
-                    key="waiting"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="text-gray-500 text-base sm:text-lg animate-pulse"
-                  >
-                    {isConnected ? "Listening to chat…" : "Connect a token to start"}
-                  </motion.p>
+                  top3Votes.map(([name, n]) => (
+                    <span
+                      key={name}
+                      className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 border border-cyan-500/25 truncate max-w-[160px]"
+                      title={name}
+                    >
+                      {name.length > 22 ? `${name.slice(0, 20)}…` : name} · {n}
+                    </span>
+                  ))
                 )}
-              </AnimatePresence>
+              </div>
+              {voteLeader && (
+                <p className="text-[11px] text-cyan-400/90">
+                  Leading:{" "}
+                  <span className="font-semibold text-white">{voteLeader}</span>{" "}
+                  <span className="text-zinc-500">
+                    (goal {voteGoal} to crown)
+                  </span>
+                </p>
+              )}
             </div>
+
+            <AnimatePresence mode="wait">
+              {hfStatus && (
+                <motion.div
+                  key="hf-status"
+                  initial={false}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -8 }}
+                  className="flex justify-center px-4 py-2 shrink-0"
+                >
+                  <div className="flex items-center justify-center gap-2 text-xs font-mono bg-fuchsia-900/30 text-fuchsia-200 border border-fuchsia-500/20 py-1.5 px-3 rounded-full w-max max-w-full">
+                    <Loader2 className="w-3 h-3 animate-spin text-fuchsia-400" />
+                    {hfStatus.stage === "pending" && (
+                      <span>
+                        Queued in HF Space...{" "}
+                        {hfStatus.position
+                          ? `Pos: ${hfStatus.position}`
+                          : ""}
+                      </span>
+                    )}
+                    {hfStatus.stage === "generating" && (
+                      <span>
+                        Generating Voice...{" "}
+                        {hfStatus.eta ? `ETA: ${hfStatus.eta}s` : ""}
+                      </span>
+                    )}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         </div>
 
@@ -1400,13 +2220,20 @@ export default function PumpfunChatPage({
               {messages.length}
             </span>
           </div>
+          <div className="px-3 py-1.5 border-b border-white/5 bg-white/[0.02] shrink-0">
+            <p className="text-[9px] text-zinc-500 leading-snug">
+              Vote for launch themes:{" "}
+              <span className="text-cyan-400/90 font-mono">!vote 1</span> or{" "}
+              <span className="text-cyan-400/90 font-mono">!pick partial-name</span>
+            </p>
+          </div>
           <div className="flex-1 overflow-y-auto p-3 space-y-2 min-h-0">
-              {!isConnected && messages.length === 0 ? (
+              {!isConnected && chatListMessages.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-gray-600 gap-3 text-xs text-center p-6">
                   <Radio className="w-8 h-8 opacity-20" />
                   <p>Awaiting connection to token feed.</p>
                 </div>
-              ) : messages.length === 0 ? (
+              ) : chatListMessages.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-gray-600 gap-3 text-xs">
                   <div className="flex gap-1 items-center opacity-50">
                     <div className="w-1.5 h-1.5 rounded-full bg-cyan-500 animate-pulse" />
@@ -1417,7 +2244,7 @@ export default function PumpfunChatPage({
                 </div>
               ) : (
                 <AnimatePresence initial={false}>
-                  {messages.map((msg, i) => {
+                  {chatListMessages.map((msg, i) => {
                     const isActive = msg.id === activeMessageId;
                     const isTooShort = msg.message.trim().length <= 3;
                     const replyText = aiReplies[msg.id];
@@ -1425,7 +2252,7 @@ export default function PumpfunChatPage({
                     return (
                       <React.Fragment key={msg.id || i}>
                         <motion.div
-                          initial={{ opacity: 0, x: -10, scale: 0.95 }}
+                          initial={false}
                           animate={{ opacity: 1, x: 0, scale: 1 }}
                           className={`pb-1 px-3 rounded-lg flex items-start gap-2 transition-all group ${
                             isActive 
@@ -1482,7 +2309,7 @@ export default function PumpfunChatPage({
 
                       {replyText && (
                         <motion.div
-                          initial={{ opacity: 0, y: -5 }}
+                          initial={false}
                           animate={{ opacity: 1, y: 0 }}
                           className="ml-8 mb-3 mt-1 py-1.5 px-3 rounded-lg bg-cyan-500/10 border border-cyan-500/20 flex items-start gap-2 backdrop-blur-sm self-start"
                         >
@@ -1515,13 +2342,13 @@ export default function PumpfunChatPage({
       <AnimatePresence>
         {showAddVoice && (
           <motion.div
-            initial={{ opacity: 0 }}
+            initial={false}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
           >
             <motion.div
-              initial={{ scale: 0.95, opacity: 0 }}
+              initial={false}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.95, opacity: 0 }}
               className="bg-[#0f0f15] border border-white/10 p-5 rounded-2xl w-full max-w-sm shadow-2xl relative"

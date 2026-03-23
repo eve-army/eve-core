@@ -10,7 +10,7 @@ const HF_BASE = "https://adamsongjam-ultimate-rvc.hf.space";
  * @param voiceModel The RVC voice model ID (e.g., "mr_krabs").
  * @param ttsVoice The base edge-tts voice (default: "en-US-ChristopherNeural").
  * @param onStatus Optional callback to receive status updates (queue pos, eta).
- * @returns A promise that resolves to the generated audio URL.
+ * @returns Audio URL, or undefined if the space never returned audio.
  */
 export async function generateHuggingFaceTts(
   text: string,
@@ -88,6 +88,8 @@ export async function generateHuggingFaceTts(
       return audioUrl;
     }
   }
+  console.warn("HF TTS: stream ended without audio data");
+  return undefined;
 }
 
 /**

@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "EVE – Pump Fun Assistant",
-  description: "EVE Pump Assistant for pump.fun live chat",
+  title: "EVE – Trend Analyst",
+  description: "EVE Trend Analyst for pump.fun live chat",
 };
 
 export default function RootLayout({

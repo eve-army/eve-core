@@ -5,7 +5,9 @@ export default function SiteFooter() {
   return (
     <footer className="fixed bottom-0 left-0 right-0 z-30 shrink-0 py-2.5 sm:py-3 border-t border-white/10 bg-[#050508] shadow-[0_-8px_24px_rgba(0,0,0,0.45)]">
       <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[10px] sm:text-[11px] text-zinc-400 px-4">
-        <span>© {new Date().getFullYear()} Eve · 4mVbX7EZonRcEfiyFbbw2ByrYc7xAkUMp3NKWhDwpump</span>
+        <span suppressHydrationWarning>
+          © {new Date().getFullYear()} Eve · 4mVbX7EZonRcEfiyFbbw2ByrYc7xAkUMp3NKWhDwpump
+        </span>
         <a
           href="https://discord.com/invite/n7vBHFf5VF"
           target="_blank"

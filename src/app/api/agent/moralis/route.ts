@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export const dynamic = 'force-dynamic';
 
+/** If the browser gets 404 on GET /api/agent/moralis, restart `next dev` or remove `.next` and rebuild. */
+
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
@@ -18,12 +20,15 @@ export async function GET(req: NextRequest) {
 
     // Example Moralis OHLCV request for Solana token
     // Using 5min bars for the last few periods 
-    const response = await fetch(`https://solana-gateway.moralis.io/token/mainnet/${tokenAddress}/ohlcv?timeframe=5m`, {
-      headers: {
-        'accept': 'application/json',
-        'X-API-Key': MORALIS_API_KEY
-      }
-    });
+    const response = await fetch(
+      `https://solana-gateway.moralis.io/token/mainnet/${encodeURIComponent(tokenAddress)}/ohlcv?timeframe=5m`,
+      {
+        headers: {
+          accept: "application/json",
+          "X-API-Key": MORALIS_API_KEY,
+        },
+      },
+    );
 
     if (!response.ok) {
       const errText = await response.text();

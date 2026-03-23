@@ -4,8 +4,11 @@
   "private": true,
   "scripts": {
     "postinstall": "node scripts/strip-native-swc.cjs",
+    "clean": "rm -rf .next",
     "dev": "NEXT_TEST_WASM=1 next dev",
+    "dev:clean": "npm run clean && npm run dev",
     "build": "NEXT_TEST_WASM=1 next build",
+    "build:clean": "npm run clean && npm run build",
     "start": "next start",
     "lint": "next lint"
   },
@@ -20,7 +23,10 @@
     "pump-chat-client": "^1.0.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "recharts": "^3.7.0"
+    "recharts": "^3.7.0",
+    "zod": "^3.24.0",
+    "echarts": "^5.6.0",
+    "echarts-for-react": "^3.0.2"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
