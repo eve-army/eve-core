@@ -16,17 +16,18 @@
     "@gradio/client": "^2.1.0",
     "@pump-fun/pump-sdk": "^1.28.0",
     "@solana/web3.js": "^1.98.4",
+    "echarts": "^5.6.0",
+    "echarts-for-react": "^3.0.2",
     "framer-motion": "^12.19.2",
     "lucide-react": "^0.525.0",
     "next": "15.5.7",
     "openai": "^5.12.2",
+    "pg": "^8.20.0",
     "pump-chat-client": "^1.0.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^3.7.0",
-    "zod": "^3.24.0",
-    "echarts": "^5.6.0",
-    "echarts-for-react": "^3.0.2"
+    "zod": "^3.24.0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",

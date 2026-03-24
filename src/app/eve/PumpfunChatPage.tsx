@@ -33,9 +33,16 @@ import {
   VOICE_HIGHLIGHT_LINGER_SEC,
   type VoiceHighlightSegment,
 } from "@/lib/voice-highlight-timeline";
+import type {
+  MemoryBundle,
+  QualityScores,
+  TurnDecision,
+  VoiceTimelineEvent,
+} from "@/lib/voice-agent/types";
 import { isPumpSpamScamMessage } from "@/lib/pump-chat-filters";
 import { buildRecentChatTranscript } from "@/lib/agent-chat-context";
 import TrendHeatLeaderboard from "@/components/TrendHeatLeaderboard";
+import { decideProactiveTurn } from "@/lib/voice-agent/proactive/scheduler";
 
 const TrendRadarChart = dynamic(() => import("@/components/TrendRadarChart"), {
   ssr: false,
@@ -54,6 +61,23 @@ const LIVE_POLL_MS = Math.max(
   ) || 15_000,
 );
 const TREND_TICK_MIN_MS = 4 * 60 * 1000;
+const TREND_TICK_CHECK_MS = 30_000;
+const TREND_TICK_JUMP_RATIO = Math.max(
+  1.1,
+  Number(
+    typeof process !== "undefined"
+      ? process.env.NEXT_PUBLIC_EVE_TREND_JUMP_RATIO
+      : undefined,
+  ) || 1.3,
+);
+const PROACTIVE_STARVATION_MS = Math.max(
+  90_000,
+  Number(
+    typeof process !== "undefined"
+      ? process.env.NEXT_PUBLIC_EVE_PROACTIVE_STARVATION_MS
+      : undefined,
+  ) || 4 * 60 * 1000,
+);
 const VOTE_GOAL_DEFAULT = 15;
 const VOTE_COOLDOWN_MS = 12_000;
 const VOTE_SUMMARY_COOLDOWN_MS = 90_000;
@@ -108,6 +132,83 @@ type AgentCallOptions = {
   activeTrendSpeaking?: string | null;
 };
 
+type ProactiveQueueItem = {
+  msg: IMessage;
+  opts: AgentCallOptions;
+  createdAt: number;
+  expiresAt: number;
+  priority: number;
+  reason: string;
+};
+
+type ReplaySummaryView = {
+  total: number;
+  ok: number;
+  failed: number;
+  passRate: number;
+  avgLatencyMs: number;
+  avgDirectness: number;
+  avgRelevance: number;
+};
+
+type TuningProfileId = "quiet" | "normal" | "high_traffic";
+
+type TuningProfile = {
+  id: TuningProfileId;
+  label: string;
+  trendTickCheckMs: number;
+  trendTickMinMs: number;
+  trendJumpRatio: number;
+  forceTrendRotateMs: number;
+  hostCheckMs: number;
+  proactiveStarvationMs: number;
+  reactiveGraceMs: number;
+  minNovelty: number;
+  allowLowNoveltyOnStarvation: boolean;
+};
+
+const TUNING_MATRIX: Record<TuningProfileId, TuningProfile> = {
+  quiet: {
+    id: "quiet",
+    label: "Quiet Room",
+    trendTickCheckMs: 20_000,
+    trendTickMinMs: 90_000,
+    trendJumpRatio: 1.15,
+    forceTrendRotateMs: 90_000,
+    hostCheckMs: 20_000,
+    proactiveStarvationMs: 120_000,
+    reactiveGraceMs: 10_000,
+    minNovelty: 0.08,
+    allowLowNoveltyOnStarvation: true,
+  },
+  normal: {
+    id: "normal",
+    label: "Normal Room",
+    trendTickCheckMs: TREND_TICK_CHECK_MS,
+    trendTickMinMs: TREND_TICK_MIN_MS,
+    trendJumpRatio: TREND_TICK_JUMP_RATIO,
+    forceTrendRotateMs: 120_000,
+    hostCheckMs: HOST_BANTER_CHECK_MS,
+    proactiveStarvationMs: PROACTIVE_STARVATION_MS,
+    reactiveGraceMs: 18_000,
+    minNovelty: 0.12,
+    allowLowNoveltyOnStarvation: true,
+  },
+  high_traffic: {
+    id: "high_traffic",
+    label: "High Traffic",
+    trendTickCheckMs: 45_000,
+    trendTickMinMs: 4 * 60_000,
+    trendJumpRatio: Math.max(1.2, TREND_TICK_JUMP_RATIO),
+    forceTrendRotateMs: 5 * 60_000,
+    hostCheckMs: 45_000,
+    proactiveStarvationMs: 5 * 60_000,
+    reactiveGraceMs: 35_000,
+    minNovelty: 0.22,
+    allowLowNoveltyOnStarvation: false,
+  },
+};
+
 function syntheticAgentMessage(
   partial: Partial<IMessage> & { message: string },
 ): IMessage {
@@ -147,6 +248,11 @@ function isSyntheticChatAgentRow(msg: IMessage): boolean {
  */
 const AGENT_CATCH_UP_LOOKBACK = 100;
 const AGENT_POLL_TAIL = 2;
+const TREND_ROTATION_POOL = 6;
+const TREND_RECENT_MEMORY = 2;
+const USE_TURN_ENDPOINT =
+  typeof process !== "undefined" &&
+  process.env.NEXT_PUBLIC_USE_AGENT_TURN_API === "1";
 
 function findLatestUnansweredChatMessage(
   messages: IMessage[],
@@ -189,6 +295,52 @@ function inferVoiceHighlightFromReply(
     if (lower.includes(n.toLowerCase())) return n;
   }
   return null;
+}
+
+function selectRotatingTrend(
+  trends: DedupedTrend[],
+  recent: string[],
+  cursor: number,
+): { trend: DedupedTrend | null; nextCursor: number } {
+  if (!trends.length) return { trend: null, nextCursor: cursor };
+  const pool = trends.slice(0, TREND_ROTATION_POOL);
+  if (!pool.length) return { trend: trends[0] ?? null, nextCursor: cursor };
+  for (let i = 0; i < pool.length; i++) {
+    const idx = (cursor + i) % pool.length;
+    const cand = pool[idx];
+    if (!cand) continue;
+    const recentlyUsed = recent.some((r) => trendDisplayNamesMatch(r, cand.trend_name));
+    if (!recentlyUsed) {
+      return { trend: cand, nextCursor: (idx + 1) % pool.length };
+    }
+  }
+  const idx = cursor % pool.length;
+  return {
+    trend: pool[idx] ?? pool[0] ?? trends[0] ?? null,
+    nextCursor: (idx + 1) % pool.length,
+  };
+}
+
+function pushProactiveQueue(
+  queueRef: React.MutableRefObject<ProactiveQueueItem[]>,
+  item: ProactiveQueueItem,
+) {
+  const q = queueRef.current.filter(
+    (x) =>
+      x.expiresAt > Date.now() &&
+      !trendDisplayNamesMatch(x.opts.activeTrendSpeaking ?? "", item.opts.activeTrendSpeaking ?? ""),
+  );
+  q.push(item);
+  q.sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt);
+  queueRef.current = q.slice(0, 6);
+}
+
+function metric(key: string) {
+  void fetch("/api/agent/metrics", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key }),
+  }).catch(() => {});
 }
 
 /** Poll resume until the context runs or timeout (needed after timer-driven TTS). */
@@ -386,10 +538,30 @@ export default function PumpfunChatPage({
   const [activeTrendHighlight, setActiveTrendHighlight] = useState<
     string | null
   >(null);
+  const [liveSubtitles, setLiveSubtitles] = useState<string>("");
+  const [memorySnapshot, setMemorySnapshot] = useState<MemoryBundle | null>(
+    null,
+  );
+  const [lastDecision, setLastDecision] = useState<TurnDecision | null>(null);
+  const [lastQuality, setLastQuality] = useState<QualityScores | null>(null);
+  const [replaySummary, setReplaySummary] = useState<ReplaySummaryView | null>(null);
+  const [replayRunning, setReplayRunning] = useState(false);
+  const [replayError, setReplayError] = useState<string | null>(null);
+  const [tuningProfileId, setTuningProfileId] = useState<TuningProfileId>("normal");
+  const tuningProfile = useMemo(
+    () => TUNING_MATRIX[tuningProfileId] ?? TUNING_MATRIX.normal,
+    [tuningProfileId],
+  );
 
   /** Sync radar highlight to spoken mentions (ElevenLabs alignment or proportional fallback). */
   const ttsHighlightScheduleRef = useRef<{
     segments: VoiceHighlightSegment[];
+    mode: "buffer" | "html";
+    bufferCtxStartTime: number | null;
+    htmlAudio: HTMLAudioElement | null;
+  } | null>(null);
+  const subtitleScheduleRef = useRef<{
+    events: VoiceTimelineEvent[];
     mode: "buffer" | "html";
     bufferCtxStartTime: number | null;
     htmlAudio: HTMLAudioElement | null;
@@ -402,14 +574,22 @@ export default function PumpfunChatPage({
     lastTop: null as string | null,
     lastHeat: 0,
     lastTickAt: 0,
+    pendingTop: null as string | null,
+    pendingHeat: 0,
     seeded: false,
   });
+  const lastTrendCommentaryAtRef = useRef(0);
+  const rotatingTrendCursorRef = useRef(0);
+  const recentTrendFocusRef = useRef<string[]>([]);
   const voteLeaderPrevRef = useRef<string | null>(null);
   const lastVoteSummaryAtRef = useRef(0);
   const winnerAnnouncedRef = useRef(false);
   /** Last time a real chatter sent a non-spam, non-vote message (for host banter decay). */
   const lastRealChatAtRef = useRef(Date.now());
   const hostBanterGuardRef = useRef({ lastAt: Date.now() });
+  const lastReactiveSpokenAtRef = useRef(0);
+  const lastProactiveSpokenAtRef = useRef(0);
+  const proactiveQueueRef = useRef<ProactiveQueueItem[]>([]);
   /** Last successful agent TTS line (say) for continuity. */
   const lastAgentSpokenRef = useRef<string | null>(null);
   /** Increments each agent call for server-side style rotation. */
@@ -420,8 +600,8 @@ export default function PumpfunChatPage({
    */
   const catchUpPollAfterConnectRef = useRef(false);
   const triggerAgentRef = useRef<
-    (msg: IMessage, opts?: AgentCallOptions) => Promise<void>
-  >(async () => {});
+    (msg: IMessage, opts?: AgentCallOptions) => Promise<boolean>
+  >(async () => false);
 
   /** Prior deduped maxHeat by trend name — for polar diff (new / heat up / down). */
   const prevTrendHeatRef = useRef<Map<string, { maxHeat: number }>>(new Map());
@@ -668,6 +848,38 @@ export default function PumpfunChatPage({
         lastSyncedHighlightRef.current = next;
         setActiveTrendHighlight(next);
       }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [isPlayingTTS]);
+
+  useEffect(() => {
+    if (!isPlayingTTS) return;
+    let raf = 0;
+    const tick = () => {
+      const sch = subtitleScheduleRef.current;
+      let elapsed = -1;
+      if (sch?.mode === "html" && sch.htmlAudio) {
+        elapsed = sch.htmlAudio.currentTime;
+      } else if (
+        sch?.mode === "buffer" &&
+        audioContextRef.current &&
+        sch.bufferCtxStartTime != null
+      ) {
+        elapsed = audioContextRef.current.currentTime - sch.bufferCtxStartTime;
+      }
+      let nextText = "";
+      if (elapsed >= 0 && sch?.events?.length) {
+        for (const ev of sch.events) {
+          if (ev.type !== "subtitle_chunk") continue;
+          if (elapsed >= ev.startSec && elapsed <= ev.endSec) {
+            nextText = ev.text;
+            break;
+          }
+        }
+      }
+      setLiveSubtitles((prev) => (prev === nextText ? prev : nextText));
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -986,10 +1198,9 @@ export default function PumpfunChatPage({
           "[Eve] triggerAgent skipped: isPlayingTTS already true (stuck run or overlapping call)",
         );
       }
-      return;
+      return false;
     }
 
-    hostBanterGuardRef.current.lastAt = Date.now();
     varietySeedRef.current += 1;
     const varietySeed = varietySeedRef.current;
     const recentChatTranscript = buildRecentChatTranscript(
@@ -1053,11 +1264,12 @@ export default function PumpfunChatPage({
       );
       let res: Response;
       try {
-        res = await fetch("/api/agent/respond", {
+        res = await fetch(USE_TURN_ENDPOINT ? "/api/agent/turn" : "/api/agent/respond", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal: ac.signal,
           body: JSON.stringify({
+            roomId: currentTokenAddress,
             message: msgToProcess.message,
             username: msgToProcess.username,
             bondingCurveData: stateRefs.current.bondingCurveData,
@@ -1094,6 +1306,10 @@ export default function PumpfunChatPage({
         error?: string;
         highlightTrendName?: string | null;
         highlightTimeline?: unknown;
+        events?: VoiceTimelineEvent[];
+        memory?: MemoryBundle;
+        decision?: TurnDecision;
+        quality?: QualityScores;
       };
       try {
         data = await res.json();
@@ -1111,6 +1327,9 @@ export default function PumpfunChatPage({
       const replyText = data.text ?? "";
       if (replyText.trim()) lastAgentSpokenRef.current = replyText.trim();
       setAiReplies((prev) => ({ ...prev, [msgToProcess.id]: replyText }));
+      setMemorySnapshot(data.memory ?? null);
+      setLastDecision(data.decision ?? null);
+      setLastQuality(data.quality ?? null);
 
       const apiHighlight =
         typeof data.highlightTrendName === "string" &&
@@ -1132,6 +1351,13 @@ export default function PumpfunChatPage({
       }
 
       let voiceHighlightTimeline: VoiceHighlightSegment[] = [];
+      const subtitleEvents: VoiceTimelineEvent[] = Array.isArray(data.events)
+        ? data.events.filter((e): e is VoiceTimelineEvent =>
+            !!e &&
+            typeof e === "object" &&
+            typeof (e as VoiceTimelineEvent).type === "string",
+          )
+        : [];
       const tlRaw = data.highlightTimeline;
       if (Array.isArray(tlRaw)) {
         for (const x of tlRaw) {
@@ -1154,6 +1380,8 @@ export default function PumpfunChatPage({
       setActiveTrendHighlight(null);
       lastSyncedHighlightRef.current = null;
       ttsHighlightScheduleRef.current = null;
+      subtitleScheduleRef.current = null;
+      setLiveSubtitles("");
 
       let audioUrl = data.audio;
       if (useHF && replyText) {
@@ -1187,8 +1415,10 @@ export default function PumpfunChatPage({
       const finishSpeechUi = () => {
         audioAnalyzerRef.current = null;
         ttsHighlightScheduleRef.current = null;
+        subtitleScheduleRef.current = null;
         lastSyncedHighlightRef.current = null;
         setActiveTrendHighlight(null);
+        setLiveSubtitles("");
         setIsPlayingTTS(false);
         setActiveMessageId(null);
         setHfStatus(null);
@@ -1311,8 +1541,25 @@ export default function PumpfunChatPage({
             };
             const tWhen = ctx.currentTime;
             source.start(tWhen);
+            const subtitleTimeline =
+              subtitleEvents.length > 0
+                ? subtitleEvents
+                : ([
+                    {
+                      type: "subtitle_chunk",
+                      startSec: 0,
+                      endSec: Math.max(2, Math.min(20, audioBuffer.duration)),
+                      text: replyText,
+                    },
+                  ] as VoiceTimelineEvent[]);
             ttsHighlightScheduleRef.current = {
               segments: timeline,
+              mode: "buffer",
+              bufferCtxStartTime: tWhen,
+              htmlAudio: null,
+            };
+            subtitleScheduleRef.current = {
+              events: subtitleTimeline,
               mode: "buffer",
               bufferCtxStartTime: tWhen,
               htmlAudio: null,
@@ -1352,6 +1599,22 @@ export default function PumpfunChatPage({
             bufferCtxStartTime: null,
             htmlAudio: audio,
           };
+          subtitleScheduleRef.current = {
+            events:
+              subtitleEvents.length > 0
+                ? subtitleEvents
+                : ([
+                    {
+                      type: "subtitle_chunk",
+                      startSec: 0,
+                      endSec: Math.max(2, Math.min(20, replyText.length * 0.052)),
+                      text: replyText,
+                    },
+                  ] as VoiceTimelineEvent[]),
+            mode: "html",
+            bufferCtxStartTime: null,
+            htmlAudio: audio,
+          };
           const tryBindHtml = bindHtmlAudioForVisualizer(audio);
           try {
             await tryBindHtml();
@@ -1384,6 +1647,13 @@ export default function PumpfunChatPage({
           [msgToProcess.id]: "answered",
         }));
       }
+      if (agentMode === "chat_reply") {
+        lastReactiveSpokenAtRef.current = Date.now();
+      } else {
+        lastProactiveSpokenAtRef.current = Date.now();
+        hostBanterGuardRef.current.lastAt = lastProactiveSpokenAtRef.current;
+      }
+      return true;
     } catch (error) {
       console.error("Agent interaction failed", error);
       ttsHighlightScheduleRef.current = null;
@@ -1407,6 +1677,7 @@ export default function PumpfunChatPage({
         setHfStatus(null);
         setAgentEphemeralRow(null);
       }, 3000);
+      return false;
     }
   },
   [selectedVoice],
@@ -1427,80 +1698,258 @@ export default function PumpfunChatPage({
       );
       audioAnalyzerRef.current = null;
       ttsHighlightScheduleRef.current = null;
+      subtitleScheduleRef.current = null;
       lastSyncedHighlightRef.current = null;
       setIsPlayingTTS(false);
       setActiveMessageId(null);
       setHfStatus(null);
       setActiveTrendHighlight(null);
+      setLiveSubtitles("");
       setAgentEphemeralRow(null);
+      proactiveQueueRef.current = [];
     }, TTS_STUCK_WATCHDOG_MS);
     return () => window.clearTimeout(id);
   }, [isPlayingTTS]);
 
   useEffect(() => {
+    if (isPlayingTTS) return;
+    if (!isConnected) return;
+    const now = Date.now();
+    const dropped = proactiveQueueRef.current.filter((x) => x.expiresAt <= now).length;
+    if (dropped > 0) {
+      for (let i = 0; i < dropped; i++) metric("proactive_skip_stale_total");
+    }
+    const q = proactiveQueueRef.current
+      .filter((x) => x.expiresAt > now)
+      .sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt);
+    if (!q.length) return;
+    const next = q.shift();
+    proactiveQueueRef.current = q;
+    if (!next) return;
+    metric("proactive_attempts_total");
+    void triggerAgentRef.current(next.msg, next.opts);
+  }, [isPlayingTTS, isConnected]);
+
+  useEffect(() => {
     if (!isConnected) return;
     const id = window.setInterval(() => {
-      if (stateRefs.current.isPlayingTTS) return;
+      if (stateRefs.current.isPlayingTTS) {
+        metric("proactive_skip_tts_busy_total");
+        if (process.env.NODE_ENV === "development") {
+          console.debug("[trend-tick] skip: tts playing");
+        }
+        return;
+      }
       const d = dedupedRef.current;
-      if (!d.length) return;
+      if (!d.length) {
+        metric("proactive_skip_no_trends_total");
+        if (process.env.NODE_ENV === "development") {
+          console.debug("[trend-tick] skip: no deduped trends");
+        }
+        return;
+      }
       const now = Date.now();
       const g = trendTickGuardRef.current;
       const top = d[0];
       if (!g.seeded) {
         g.lastTop = top.trend_name;
         g.lastHeat = top.maxHeat;
+        g.pendingTop = null;
+        g.pendingHeat = 0;
         g.seeded = true;
-        return;
-      }
-      if (now - g.lastTickAt < TREND_TICK_MIN_MS) {
-        g.lastHeat = top.maxHeat;
-        g.lastTop = top.trend_name;
+        if (process.env.NODE_ENV === "development") {
+          console.debug("[trend-tick] seed baseline", {
+            top: g.lastTop,
+            heat: g.lastHeat,
+          });
+        }
         return;
       }
       const changed = top.trend_name !== g.lastTop;
-      const jumped = g.lastHeat > 5 && top.maxHeat > g.lastHeat * 1.35;
-      g.lastHeat = top.maxHeat;
-      g.lastTop = top.trend_name;
-      if (!changed && !jumped) return;
-      g.lastTickAt = now;
-      void triggerAgentRef.current(
-        syntheticAgentMessage({
-          id: `trend-tick-${now}`,
-          message: `Voice cue: spotlighting “${top.trend_name}” on the radar.`,
-          username: "TrendRadar",
-        }),
-        { agentMode: "trend_tick", activeTrendSpeaking: top.trend_name },
+      const jumped =
+        g.lastHeat > 5 && top.maxHeat > g.lastHeat * tuningProfile.trendJumpRatio;
+      const forceRotate =
+        now - lastTrendCommentaryAtRef.current >= tuningProfile.forceTrendRotateMs;
+      const inCooldown = now - g.lastTickAt < tuningProfile.trendTickMinMs;
+      if (inCooldown) {
+        metric("proactive_skip_cooldown_total");
+        if (changed || jumped) {
+          g.pendingTop = top.trend_name;
+          g.pendingHeat = top.maxHeat;
+        }
+        if (process.env.NODE_ENV === "development") {
+          console.debug("[trend-tick] skip: cooldown", {
+            remainingMs: tuningProfile.trendTickMinMs - (now - g.lastTickAt),
+            changed,
+            jumped,
+            forceRotate,
+            pendingTop: g.pendingTop,
+          });
+        }
+        return;
+      }
+
+      const hasPending = !!g.pendingTop;
+      const pendingTop = g.pendingTop;
+      const shouldTrigger = changed || jumped || hasPending || forceRotate;
+      if (!shouldTrigger) {
+        if (process.env.NODE_ENV === "development") {
+          console.debug("[trend-tick] skip: no change", {
+            top: top.trend_name,
+            heat: top.maxHeat,
+          });
+        }
+        return;
+      }
+
+      const preferred =
+        pendingTop && d.find((x) => trendDisplayNamesMatch(x.trend_name, pendingTop))
+          ? d.find((x) => trendDisplayNamesMatch(x.trend_name, pendingTop)) ?? top
+          : top;
+      const selected = selectRotatingTrend(
+        d,
+        recentTrendFocusRef.current,
+        rotatingTrendCursorRef.current,
       );
-    }, 60_000);
+      const focusTrend =
+        selected.trend &&
+        !trendDisplayNamesMatch(selected.trend.trend_name, g.lastTop)
+          ? selected.trend
+          : preferred;
+      rotatingTrendCursorRef.current = selected.nextCursor;
+      if (!focusTrend) return;
+
+      const trendTickMsg = syntheticAgentMessage({
+        id: `trend-tick-${now}`,
+        message: `Voice cue: spotlighting “${focusTrend.trend_name}” on the radar.`,
+        username: "TrendRadar",
+      });
+      metric("proactive_attempts_total");
+      void triggerAgentRef.current(trendTickMsg, {
+        agentMode: "trend_tick",
+        activeTrendSpeaking: focusTrend.trend_name,
+      }).then((started) => {
+        if (!started) {
+          metric("proactive_skip_tts_busy_total");
+          pushProactiveQueue(proactiveQueueRef, {
+            msg: trendTickMsg,
+            opts: {
+              agentMode: "trend_tick",
+              activeTrendSpeaking: focusTrend.trend_name,
+            },
+            createdAt: Date.now(),
+            expiresAt: Date.now() + 2 * 60_000,
+            priority: 9,
+            reason: "tts_busy",
+          });
+          if (process.env.NODE_ENV === "development") {
+            console.debug("[trend-tick] skipped: triggerAgent did not start");
+          }
+          return;
+        }
+        g.lastTickAt = Date.now();
+        lastTrendCommentaryAtRef.current = Date.now();
+        metric("proactive_fired_total");
+        g.lastTop = top.trend_name;
+        g.lastHeat = top.maxHeat;
+        g.pendingTop = null;
+        g.pendingHeat = 0;
+        recentTrendFocusRef.current = [
+          focusTrend.trend_name,
+          ...recentTrendFocusRef.current.filter(
+            (n) => !trendDisplayNamesMatch(n, focusTrend.trend_name),
+          ),
+        ].slice(0, TREND_RECENT_MEMORY);
+        if (process.env.NODE_ENV === "development") {
+          console.debug("[trend-tick] fired", {
+            focus: focusTrend.trend_name,
+            top: top.trend_name,
+          });
+        }
+      });
+    }, tuningProfile.trendTickCheckMs);
     return () => window.clearInterval(id);
-  }, [isConnected]);
+  }, [isConnected, tuningProfile]);
 
   useEffect(() => {
     if (!isConnected) return;
     const id = window.setInterval(() => {
-      if (stateRefs.current.isPlayingTTS) return;
       const d = dedupedRef.current;
       if (!d.length) return;
       const now = Date.now();
-      const silence = now - lastRealChatAtRef.current;
-      let minGap = 50_000;
-      if (silence > 5 * 60 * 1000) minGap = 90_000;
-      if (silence > 12 * 60 * 1000) minGap = 4 * 60 * 1000;
-
-      if (now - hostBanterGuardRef.current.lastAt < minGap) return;
-
-      void triggerAgentRef.current(
-        syntheticAgentMessage({
-          id: `host-banter-${now}`,
-          message:
-            "Voice cue: host energy — keeping momentum while chat is quiet.",
-          username: "HostFill",
-        }),
-        { agentMode: "host_banter", activeTrendSpeaking: null },
+      const proactive = decideProactiveTurn({
+        nowMs: now,
+        lastRealChatAtMs: lastRealChatAtRef.current,
+        lastSpokenAtMs: lastProactiveSpokenAtRef.current || hostBanterGuardRef.current.lastAt,
+        liveTrends: d,
+        lastReactiveSpokenAtMs: lastReactiveSpokenAtRef.current,
+        starvationMs: tuningProfile.proactiveStarvationMs,
+        reactiveGraceMs: tuningProfile.reactiveGraceMs,
+        minNovelty: tuningProfile.minNovelty,
+        allowLowNoveltyOnStarvation: tuningProfile.allowLowNoveltyOnStarvation,
+      });
+      if (!proactive.shouldFire) {
+        if (proactive.reason === "cooldown") metric("proactive_skip_cooldown_total");
+        if (proactive.reason === "no_trends") metric("proactive_skip_no_trends_total");
+        return;
+      }
+      const selected = selectRotatingTrend(
+        d,
+        recentTrendFocusRef.current,
+        rotatingTrendCursorRef.current,
       );
-    }, HOST_BANTER_CHECK_MS);
+      rotatingTrendCursorRef.current = selected.nextCursor;
+      const focusTrend = selected.trend?.trend_name ?? d[0]?.trend_name ?? null;
+
+      const hostMsg = syntheticAgentMessage({
+        id: `host-banter-${now}`,
+        message: focusTrend
+          ? `Voice cue: host energy — checking heat on “${focusTrend}” and inviting chat input.`
+          : "Voice cue: host energy — keeping momentum while chat is quiet.",
+        username: "HostFill",
+      });
+      if (stateRefs.current.isPlayingTTS) {
+        metric("proactive_skip_tts_busy_total");
+        pushProactiveQueue(proactiveQueueRef, {
+          msg: hostMsg,
+          opts: { agentMode: "host_banter", activeTrendSpeaking: focusTrend },
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 2 * 60_000,
+          priority: proactive.priority,
+          reason: "tts_busy",
+        });
+        return;
+      }
+      metric("proactive_attempts_total");
+      void triggerAgentRef.current(hostMsg, {
+        agentMode: "host_banter",
+        activeTrendSpeaking: focusTrend,
+      }).then((started) => {
+        if (!started) {
+          metric("proactive_skip_tts_busy_total");
+          return;
+        }
+        metric("proactive_fired_total");
+        if (focusTrend) {
+          recentTrendFocusRef.current = [
+            focusTrend,
+            ...recentTrendFocusRef.current.filter(
+              (n) => !trendDisplayNamesMatch(n, focusTrend),
+            ),
+          ].slice(0, TREND_RECENT_MEMORY);
+        }
+        if (process.env.NODE_ENV === "development") {
+          console.debug("[host-banter] fired", {
+            focusTrend,
+            novelty: proactive.noveltyScore,
+            minGapMs: proactive.minGapMs,
+            reason: proactive.reason,
+          });
+        }
+      }).catch(() => {});
+    }, tuningProfile.hostCheckMs);
     return () => window.clearInterval(id);
-  }, [isConnected]);
+  }, [isConnected, tuningProfile]);
 
   useEffect(() => {
     for (const [name, n] of Object.entries(voteTally)) {
@@ -1779,6 +2228,31 @@ export default function PumpfunChatPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- run once when default room is present; handleConnect stable enough for initial connect
   }, [addressInput, autoConnect]);
 
+  const runReplaySample = useCallback(async () => {
+    setReplayRunning(true);
+    setReplayError(null);
+    try {
+      const res = await fetch("/api/agent/replay", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ datasetPath: "data/replay/sample.jsonl" }),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        summary?: ReplaySummaryView;
+        error?: string;
+      };
+      if (!res.ok || !data.ok || !data.summary) {
+        throw new Error(data.error || "Replay run failed");
+      }
+      setReplaySummary(data.summary);
+    } catch (error: unknown) {
+      setReplayError(error instanceof Error ? error.message : "Replay run failed");
+    } finally {
+      setReplayRunning(false);
+    }
+  }, []);
+
   const handleDisconnect = () => {
     if (connectHandshakeTimerRef.current != null) {
       window.clearTimeout(connectHandshakeTimerRef.current);
@@ -1814,11 +2288,27 @@ export default function PumpfunChatPage({
       lastTop: null,
       lastHeat: 0,
       lastTickAt: 0,
+      pendingTop: null,
+      pendingHeat: 0,
       seeded: false,
     };
+    rotatingTrendCursorRef.current = 0;
+    recentTrendFocusRef.current = [];
+    lastTrendCommentaryAtRef.current = 0;
+    proactiveQueueRef.current = [];
+    lastReactiveSpokenAtRef.current = 0;
+    lastProactiveSpokenAtRef.current = 0;
     ttsHighlightScheduleRef.current = null;
+    subtitleScheduleRef.current = null;
     lastSyncedHighlightRef.current = null;
     setActiveTrendHighlight(null);
+    setLiveSubtitles("");
+    setMemorySnapshot(null);
+    setLastDecision(null);
+    setLastQuality(null);
+    setReplaySummary(null);
+    setReplayRunning(false);
+    setReplayError(null);
     setError(null);
     setConnectionNotice(null);
     lastAgentSpokenRef.current = null;
@@ -2067,16 +2557,104 @@ export default function PumpfunChatPage({
               </span>
             </div>
             <div className="flex-1 min-w-0 flex items-center justify-end self-center">
-              {connectionNotice ? (
-                <span
-                  className="text-xs sm:text-sm text-amber-400/95 tabular-nums text-right truncate max-w-full"
-                  title={connectionNotice}
+              <div className="flex items-center gap-2 sm:gap-3 max-w-full">
+                <label className="text-[10px] sm:text-xs text-zinc-400 uppercase tracking-wider">
+                  Autonomy
+                </label>
+                <select
+                  value={tuningProfileId}
+                  onChange={(e) => setTuningProfileId(e.target.value as TuningProfileId)}
+                  className="bg-black/40 border border-white/15 rounded px-2 py-1 text-[11px] sm:text-xs text-zinc-200"
                 >
-                  {connectionNotice}
-                </span>
-              ) : null}
+                  <option value="quiet">Quiet Room</option>
+                  <option value="normal">Normal Room</option>
+                  <option value="high_traffic">High Traffic</option>
+                </select>
+                {connectionNotice ? (
+                  <span
+                    className="text-xs sm:text-sm text-amber-400/95 tabular-nums text-right truncate max-w-[44vw]"
+                    title={connectionNotice}
+                  >
+                    {connectionNotice}
+                  </span>
+                ) : null}
+              </div>
             </div>
           </div>
+
+          {(isConnected || liveSubtitles || lastDecision || memorySnapshot || lastQuality || replaySummary || replayError || replayRunning) && (
+            <div className="relative z-10 px-4 sm:px-6 lg:px-8 pb-2 space-y-2">
+              {liveSubtitles ? (
+                <div className="px-3 py-2 rounded-lg border border-cyan-500/30 bg-cyan-500/10 text-cyan-100 text-sm leading-snug">
+                  {liveSubtitles}
+                </div>
+              ) : null}
+              <div className="grid grid-cols-1 lg:grid-cols-4 gap-2">
+                <div className="rounded-lg border border-white/10 bg-black/25 px-3 py-2">
+                  <p className="text-[10px] uppercase tracking-wider text-zinc-400">
+                    Turn Rationale
+                  </p>
+                  <p className="text-xs text-zinc-200 mt-1">
+                    {lastDecision
+                      ? `${lastDecision.turnKind} / ${lastDecision.intent} · ${lastDecision.reason}`
+                      : "—"}
+                  </p>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/25 px-3 py-2">
+                  <p className="text-[10px] uppercase tracking-wider text-zinc-400">
+                    Memory Chips
+                  </p>
+                  <div className="mt-1 flex flex-wrap gap-1.5">
+                    {(memorySnapshot?.longTermFacts ?? []).slice(0, 3).map((f) => (
+                      <span
+                        key={f.key}
+                        className="text-[10px] px-2 py-0.5 rounded-full bg-fuchsia-500/15 border border-fuchsia-500/30 text-fuchsia-200"
+                        title={f.value}
+                      >
+                        {f.value.slice(0, 36)}
+                      </span>
+                    ))}
+                    {(memorySnapshot?.longTermFacts ?? []).length === 0 ? (
+                      <span className="text-xs text-zinc-500">No memory facts yet</span>
+                    ) : null}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/25 px-3 py-2">
+                  <p className="text-[10px] uppercase tracking-wider text-zinc-400">
+                    Quality
+                  </p>
+                  <p className="text-xs text-zinc-200 mt-1">
+                    {lastQuality
+                      ? `d ${lastQuality.directness.toFixed(2)} · r ${lastQuality.relevance.toFixed(2)} · n ${lastQuality.novelty.toFixed(2)}`
+                      : "—"}
+                  </p>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/25 px-3 py-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[10px] uppercase tracking-wider text-zinc-400">
+                      Replay
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => void runReplaySample()}
+                      disabled={replayRunning}
+                      className="text-[10px] px-2 py-0.5 rounded border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/10 disabled:opacity-50"
+                    >
+                      {replayRunning ? "Running..." : "Run sample"}
+                    </button>
+                  </div>
+                  <p className="text-xs text-zinc-200 mt-1">
+                    {replaySummary
+                      ? `${Math.round(replaySummary.passRate * 100)}% pass · ${Math.round(replaySummary.avgLatencyMs)}ms · d ${replaySummary.avgDirectness.toFixed(2)}`
+                      : "No replay run yet"}
+                  </p>
+                  {replayError ? (
+                    <p className="text-[10px] text-red-400 mt-1">{replayError}</p>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          )}
 
           <div className="flex-1 flex flex-col min-h-0 overflow-y-auto overflow-x-hidden relative z-10">
             <div className="flex-1 min-h-0 flex flex-col px-2 sm:px-3 pt-1 pb-1 lg:pt-0">
