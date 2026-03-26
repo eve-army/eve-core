@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { runTurn } from "@/lib/voice-agent/orchestrator/engine";
+import { recordOpsAfterTurn } from "@/lib/ops-streams/record-turn";
 import type { TurnRequest } from "@/lib/voice-agent/types";
 
 export const dynamic = "force-dynamic";
@@ -12,6 +13,7 @@ export async function POST(req: NextRequest) {
   try {
     const body = (await req.json()) as TurnRequest;
     const out = await runTurn(body);
+    void recordOpsAfterTurn(body, out);
     return NextResponse.json({
       text: out.text,
       audio: out.audio,

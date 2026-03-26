@@ -10,6 +10,8 @@ export type EveStreamPublicConfig = {
   streamTicker: string;
   autoConnect: boolean;
   kiosk: boolean;
+  /** 640×360-style embed: radar-first, compact chrome, per-trend stream colors. */
+  streamLayout: boolean;
 };
 
 function pick(runtime: string | undefined, baked: string | undefined): string {
@@ -46,6 +48,10 @@ export function getEveStreamPublicConfig(): EveStreamPublicConfig {
     truthyEnv(process.env.EVE_KIOSK) ||
     process.env.NEXT_PUBLIC_EVE_KIOSK === "1";
 
+  const streamLayout =
+    truthyEnv(process.env.EVE_STREAM_LAYOUT) ||
+    truthyEnv(process.env.NEXT_PUBLIC_EVE_STREAM_LAYOUT);
+
   return {
     defaultRoom,
     streamUsername,
@@ -53,5 +59,6 @@ export function getEveStreamPublicConfig(): EveStreamPublicConfig {
     streamTicker,
     autoConnect,
     kiosk,
+    streamLayout,
   };
 }

@@ -31,6 +31,15 @@ export type TurnRequest = {
   activeTrendSpeaking?: string | null;
   recentChatTranscript?: string;
   lastAgentSay?: string | null;
+  /** Last turn's radar highlight trend — server avoids repeating the same spotlight. */
+  lastAgentHighlightTrend?: string | null;
+  /**
+   * Trend names whose radar row is `change: "new"` vs the prior poll (client diff).
+   * Agent should prioritize calling these out; same order as heat-ranked polar when possible.
+   */
+  newTrendNamesFromRadar?: string[];
+  /** Session-scoped trend names already spoken about; client fills from reply text matches. */
+  recentlyMentionedTrendNames?: string[];
   streamName?: string;
   isBondedToken?: boolean;
   solUsdPrice?: number | null;

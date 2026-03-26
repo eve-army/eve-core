@@ -167,6 +167,8 @@ export type TrendPolarPoint = {
   trend_name: string;
   maxHeat: number;
   sentiment: string;
+  /** Short blurb from live-trends API (deduped). */
+  summary: string;
   angleDeg: number;
   change: TrendChangeKind;
 };
@@ -273,6 +275,7 @@ export function buildTrendPolarScatterData(
       trend_name: d.trend_name,
       maxHeat: mh,
       sentiment: d.sentiment || "Unknown",
+      summary: (d.summary || "").trim().slice(0, 400),
       angleDeg,
       change,
     };
@@ -366,7 +369,23 @@ export function buildHeatmapData(
   return { xLabels, yLabels, seriesData, yTrendKeys };
 }
 
+/** Normalized one-line brief for LLM prompts (whitespace collapsed, capped length). */
+function briefForAgentPrompt(t: DedupedTrend, maxLen: number): string {
+  return (t.summary || "").replace(/\s+/g, " ").trim().slice(0, maxLen);
+}
+
+/**
+ * Numbered line for the agent system prompt: name, heat, sentiment, optional brief from live-trends API.
+ */
+export function formatDedupedTrendPromptLine(t: DedupedTrend, index: number): string {
+  const heat = Number.isFinite(t.maxHeat) ? t.maxHeat.toFixed(1) : "?";
+  const sent = t.sentiment || "mixed";
+  const brief = briefForAgentPrompt(t, 220);
+  const briefPart = brief.length > 0 ? ` · brief: ${brief}` : "";
+  return `${index + 1}. "${t.trend_name}" — heat ${heat} · ${sent}${briefPart}`;
+}
+
 export function trimTrendForPrompt(t: DedupedTrend): string {
-  const sum = t.summary.replace(/\s+/g, " ").trim().slice(0, 200);
+  const sum = briefForAgentPrompt(t, 200);
   return `${t.trend_name} [heat ${t.maxHeat}, ${t.sentiment}] ${sum}`;
 }

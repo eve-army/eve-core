@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { PumpChatClient } from 'pump-chat-client';
+import { isPumpSpamScamMessage } from '@/lib/pump-chat-filters';
 
 export const dynamic = 'force-dynamic';
 
@@ -52,11 +53,19 @@ export async function GET(req: NextRequest) {
       });
 
       client.on('message', (message) => {
+        const text = typeof message?.message === 'string' ? message.message.trim() : '';
+        if (text && isPumpSpamScamMessage(text)) return;
         safeEnqueue(`data: ${JSON.stringify({ type: 'message', data: message })}\n\n`);
       });
 
       client.on('messageHistory', (history) => {
-        safeEnqueue(`data: ${JSON.stringify({ type: 'messageHistory', data: history })}\n\n`);
+        const list = Array.isArray(history)
+          ? history.filter((m: { message?: string }) => {
+              const t = typeof m?.message === 'string' ? m.message.trim() : '';
+              return !t || !isPumpSpamScamMessage(t);
+            })
+          : history;
+        safeEnqueue(`data: ${JSON.stringify({ type: 'messageHistory', data: list })}\n\n`);
       });
 
       client.on('error', (err) => {

@@ -16,6 +16,62 @@ export type CharacterAlignment = {
 export const VOICE_HIGHLIGHT_LINGER_SEC = 2.6;
 
 /**
+ * Longest word-aligned substring of `trendName` that appears in `text` (case-insensitive).
+ * Used when the host shortens a trend (“choose financial mentors”) vs the full leaderboard label.
+ */
+export function findWordAlignedSubphraseSpan(
+  text: string,
+  trendName: string,
+): { start: number; end: number } | null {
+  const lower = text.toLowerCase();
+  const tn = trendName.trim();
+  if (tn.length < 3) return null;
+  const words = tn.split(/\s+/).filter((w) => w.length > 0);
+  if (words.length === 0) return null;
+
+  let best: { start: number; end: number; len: number } | null = null;
+  for (let i = 0; i < words.length; i++) {
+    for (let j = words.length; j > i; j--) {
+      const phrase = words.slice(i, j).join(" ");
+      const wordCount = j - i;
+      if (phrase.length < 6) continue;
+      if (phrase.length < 10 && wordCount < 2) continue;
+      const idx = lower.indexOf(phrase.toLowerCase());
+      if (idx !== -1 && (!best || phrase.length > best.len)) {
+        best = { start: idx, end: idx + phrase.length, len: phrase.length };
+      }
+    }
+  }
+  return best ? { start: best.start, end: best.end } : null;
+}
+
+/**
+ * Single highlight window from when a named trend is spoken (partial phrase ok), for fallback paths.
+ */
+export function buildTimelineForTrendMention(
+  text: string,
+  trendName: string,
+  durationSec: number,
+  lingerSec: number,
+  resolveCanonical: (raw: string) => string | null,
+): VoiceHighlightSegment[] {
+  if (durationSec <= 0 || !text.trim() || !trendName.trim()) return [];
+  const canon = resolveCanonical(trendName.trim()) ?? trendName.trim();
+  const span =
+    findWordAlignedSubphraseSpan(text, canon) ??
+    findWordAlignedSubphraseSpan(text, trendName.trim());
+  if (!span) return [];
+  const textLen = Math.max(1, text.length);
+  return mergeAdjacentSameTrend([
+    {
+      trendName: canon,
+      startSec: (span.start / textLen) * durationSec,
+      endSec: (span.end / textLen) * durationSec + lingerSec,
+    },
+  ]);
+}
+
+/**
  * Find non-overlapping mentions of allowed trend names in spoken text (longest names first).
  */
 export function collectNonOverlappingTrendSpans(
@@ -32,9 +88,17 @@ export function collectNonOverlappingTrendSpans(
     const tl = name.toLowerCase();
     let from = 0;
     let idx: number;
+    let gotFull = false;
     while ((idx = lower.indexOf(tl, from)) !== -1) {
+      gotFull = true;
       candidates.push({ name, start: idx, end: idx + name.length });
       from = idx + 1;
+    }
+    if (!gotFull) {
+      const partial = findWordAlignedSubphraseSpan(text, name);
+      if (partial) {
+        candidates.push({ name, start: partial.start, end: partial.end });
+      }
     }
   }
 

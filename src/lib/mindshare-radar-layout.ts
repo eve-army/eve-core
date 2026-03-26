@@ -7,10 +7,16 @@ export const POLAR_CENTER_Y = 0.5;
  * Tuned for the centered square chart so rings + labels stay readable.
  */
 export const POLAR_RADIUS = 0.78;
+/** Tighter polar for stream embeds — leaves canvas margin so long labels aren’t cut off at the rim. */
+export const POLAR_RADIUS_STREAM = 0.62;
 
-export function polarPixelLayout(width: number, height: number) {
+export function polarPixelLayout(
+  width: number,
+  height: number,
+  radiusFraction: number = POLAR_RADIUS,
+) {
   const halfMin = Math.min(width, height) / 2;
-  const polarRadiusPx = POLAR_RADIUS * halfMin;
+  const polarRadiusPx = radiusFraction * halfMin;
   return {
     cx: width * POLAR_CENTER_X,
     cy: height * POLAR_CENTER_Y,

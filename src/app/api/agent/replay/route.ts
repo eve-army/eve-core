@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getOpsSessionAddress } from "@/lib/ops-auth/request-session";
 import { loadReplayCasesFromJsonl, runReplay, summarizeReplay, type ReplayCase } from "@/lib/voice-agent/replay/harness";
 
 export const dynamic = "force-dynamic";
@@ -13,6 +14,9 @@ function isAllowedDatasetPath(p: string): boolean {
 }
 
 export async function POST(req: NextRequest) {
+  if (!getOpsSessionAddress(req)) {
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
   try {
     const body = (await req.json()) as ReplayBody;
     let cases: ReplayCase[] = [];

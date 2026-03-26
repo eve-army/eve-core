@@ -3,8 +3,8 @@ import React from "react";
 /** Matches social-tts site footer (© Eve · mint + Discord). Fixed so it stays visible on the full-bleed /eve layout. */
 export default function SiteFooter() {
   return (
-    <footer className="fixed bottom-0 left-0 right-0 z-30 shrink-0 py-2.5 sm:py-3 border-t border-white/10 bg-[#050508] shadow-[0_-8px_24px_rgba(0,0,0,0.45)]">
-      <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[10px] sm:text-[11px] text-zinc-400 px-4">
+    <footer className="fixed bottom-0 left-0 right-0 z-30 shrink-0 py-2.5 sm:py-3 border-t border-[color:var(--eve-border)] bg-[var(--eve-bg-deep)] shadow-[0_-12px_32px_rgba(0,0,0,0.55)]">
+      <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[10px] sm:text-[11px] text-[color:var(--eve-muted)] px-4">
         <span suppressHydrationWarning>
           © {new Date().getFullYear()} Eve · 4mVbX7EZonRcEfiyFbbw2ByrYc7xAkUMp3NKWhDwpump
         </span>
@@ -12,7 +12,7 @@ export default function SiteFooter() {
           href="https://discord.com/invite/n7vBHFf5VF"
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-zinc-400 hover:text-cyan-300/90 transition-colors"
+          className="inline-flex items-center gap-1 text-[color:var(--eve-muted)] hover:text-[color:var(--eve-accent-a)] transition-colors"
           aria-label="Join Eve Army on Discord"
         >
           <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden>

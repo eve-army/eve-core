@@ -1,9 +1,16 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useMemo,
+  useCallback,
+  useSyncExternalStore,
+} from "react";
 import type { EveStreamPublicConfig } from "./stream-config";
 import { IMessage } from '@/lib/pumpChatClient';
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import {
   Play,
   Square,
@@ -26,28 +33,41 @@ import type { DedupedTrend, LiveTrendRow } from "@/lib/live-trends";
 import {
   dedupeTrendsByName,
   buildTrendPolarScatterData,
+  normalizeTrendKey,
   trendDisplayNamesMatch,
 } from "@/lib/live-trends";
 import {
   buildProportionalHighlightTimeline,
+  buildTimelineForTrendMention,
   VOICE_HIGHLIGHT_LINGER_SEC,
   type VoiceHighlightSegment,
 } from "@/lib/voice-highlight-timeline";
-import type {
-  MemoryBundle,
-  QualityScores,
-  TurnDecision,
-  VoiceTimelineEvent,
-} from "@/lib/voice-agent/types";
+import type { VoiceTimelineEvent } from "@/lib/voice-agent/types";
 import { isPumpSpamScamMessage } from "@/lib/pump-chat-filters";
 import { buildRecentChatTranscript } from "@/lib/agent-chat-context";
 import TrendHeatLeaderboard from "@/components/TrendHeatLeaderboard";
+import { streamTrendColor } from "@/lib/trend-stream-palette";
 import { decideProactiveTurn } from "@/lib/voice-agent/proactive/scheduler";
+
+/** Plan Option B: auto-enable stream UI when viewport fits pump-style embed (no env required). */
+const STREAM_EMBED_MQ = "(max-width: 640px) and (max-height: 480px)";
+
+function subscribeStreamEmbedViewport(cb: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  const mq = window.matchMedia(STREAM_EMBED_MQ);
+  mq.addEventListener("change", cb);
+  return () => mq.removeEventListener("change", cb);
+}
+
+function getStreamEmbedViewportSnapshot(): boolean {
+  if (typeof window === "undefined") return false;
+  return window.matchMedia(STREAM_EMBED_MQ).matches;
+}
 
 const TrendRadarChart = dynamic(() => import("@/components/TrendRadarChart"), {
   ssr: false,
   loading: () => (
-    <div className="w-full min-h-[220px] rounded-xl border border-white/10 bg-black/20 animate-pulse" />
+    <div className="w-full min-h-[220px] rounded-xl border border-[color:var(--eve-border)] bg-[var(--eve-surface)] animate-pulse" />
   ),
 });
 
@@ -78,9 +98,6 @@ const PROACTIVE_STARVATION_MS = Math.max(
       : undefined,
   ) || 4 * 60 * 1000,
 );
-const VOTE_GOAL_DEFAULT = 15;
-const VOTE_COOLDOWN_MS = 12_000;
-const VOTE_SUMMARY_COOLDOWN_MS = 90_000;
 /** Host banter check interval; actual spacing uses silence decay inside handler. */
 const HOST_BANTER_CHECK_MS = 30_000;
 /** Abort agent API fetch if the server or network hangs. */
@@ -89,6 +106,14 @@ const AGENT_FETCH_TIMEOUT_MS = 90_000;
 const HF_TTS_TIMEOUT_MS = 180_000;
 /** If playback never finishes, reset so the poller can run again. */
 const TTS_STUCK_WATCHDOG_MS = 4 * 60 * 1000;
+/** After TTS ends, keep radar/card highlight this long so the summary stays readable. */
+const TREND_HIGHLIGHT_READ_LINGER_MS = 6_000;
+/** No-audio fallback: show highlight after this delay (no waveform to sync to). */
+const NO_AUDIO_TREND_HIGHLIGHT_DELAY_MS = 1_200;
+/** Proactive speech when radar shows new trends (heat order); max names per cue. */
+const NEW_RADAR_SPEECH_MAX_NAMES = 2;
+/** Min gap between NEW ON RADAR speeches so we don’t stack with trend tick / host. */
+const NEW_RADAR_SPEECH_MIN_GAP_MS = 35_000;
 
 /**
  * Create/resume Web Audio on a real user gesture so TTS can play later.
@@ -139,16 +164,6 @@ type ProactiveQueueItem = {
   expiresAt: number;
   priority: number;
   reason: string;
-};
-
-type ReplaySummaryView = {
-  total: number;
-  ok: number;
-  failed: number;
-  passRate: number;
-  avgLatencyMs: number;
-  avgDirectness: number;
-  avgRelevance: number;
 };
 
 type TuningProfileId = "quiet" | "normal" | "high_traffic";
@@ -226,7 +241,7 @@ function syntheticAgentMessage(
 }
 
 const SYNTHETIC_AGENT_USERNAMES = new Set(
-  ["trendradar", "votebooth", "hostfill"].map((s) => s.toLowerCase()),
+  ["trendradar", "hostfill"].map((s) => s.toLowerCase()),
 );
 
 /** Rows that trigger the agent but are not in the live pump feed — shown ephemerally during TTS. */
@@ -237,8 +252,7 @@ function isSyntheticChatAgentRow(msg: IMessage): boolean {
   return (
     id.startsWith("trend-tick-") ||
     id.startsWith("host-banter-") ||
-    id.startsWith("vote-sum-") ||
-    id.startsWith("winner-")
+    id.startsWith("new-radar-")
   );
 }
 
@@ -253,6 +267,8 @@ const TREND_RECENT_MEMORY = 2;
 const USE_TURN_ENDPOINT =
   typeof process !== "undefined" &&
   process.env.NEXT_PUBLIC_USE_AGENT_TURN_API === "1";
+
+const SOLANA_MINT_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,48}$/;
 
 function findLatestUnansweredChatMessage(
   messages: IMessage[],
@@ -295,6 +311,26 @@ function inferVoiceHighlightFromReply(
     if (lower.includes(n.toLowerCase())) return n;
   }
   return null;
+}
+
+/** Every LIVE MINDSHARE trend whose title appears as substring in the agent reply (longest names first). */
+function collectMentionedTrendsFromReply(
+  reply: string,
+  trends: DedupedTrend[],
+): string[] {
+  const t = reply.trim();
+  if (!t || trends.length === 0) return [];
+  const lower = t.toLowerCase();
+  const sorted = [...trends].sort(
+    (a, b) => b.trend_name.length - a.trend_name.length,
+  );
+  const out: string[] = [];
+  for (const row of sorted) {
+    const n = row.trend_name.trim();
+    if (n.length < 2) continue;
+    if (lower.includes(n.toLowerCase())) out.push(row.trend_name);
+  }
+  return out;
 }
 
 function selectRotatingTrend(
@@ -392,33 +428,6 @@ function isVoteOnlyMessage(text: string): boolean {
   return /^!(?:vote|v|pick)\b/i.test(text.trim());
 }
 
-function parseChatVote(
-  text: string,
-  trendOptions: string[],
-): { key: string } | null {
-  const t = text.trim();
-  const num = t.match(/^(?:!vote|!v)\s+(\d+)\s*$/i);
-  if (num) {
-    const idx = parseInt(num[1], 10) - 1;
-    if (idx >= 0 && idx < trendOptions.length) return { key: trendOptions[idx] };
-    return null;
-  }
-  const pick = t.match(/^!pick\s+(.+)$/i);
-  if (pick) {
-    const q = pick[1].trim().toLowerCase();
-    if (!q) return null;
-    const exact = trendOptions.find((n) => n.toLowerCase() === q);
-    if (exact) return { key: exact };
-    const sub = trendOptions.find(
-      (n) =>
-        n.toLowerCase().includes(q) ||
-        (q.length >= 3 && n.toLowerCase().includes(q.slice(0, 14))),
-    );
-    if (sub) return { key: sub };
-  }
-  return null;
-}
-
 import { Connection, PublicKey } from "@solana/web3.js";
 import { OnlinePumpSdk } from "@pump-fun/pump-sdk";
 import { AreaChart, Area, YAxis, ResponsiveContainer, Tooltip } from 'recharts';
@@ -485,7 +494,30 @@ export default function PumpfunChatPage({
   streamTicker: initialStreamTicker,
   autoConnect,
   kiosk: isEveKiosk,
+  streamLayout: isStreamLayoutProp,
 }: EveStreamPublicConfig) {
+  const streamLayoutForced =
+    isStreamLayoutProp ||
+    (typeof process !== "undefined" &&
+      (() => {
+        const v = process.env.NEXT_PUBLIC_EVE_STREAM_LAYOUT;
+        return v === "1" || v?.toLowerCase() === "true";
+      })());
+
+  const streamLayoutAuto = useSyncExternalStore(
+    subscribeStreamEmbedViewport,
+    getStreamEmbedViewportSnapshot,
+    () => false,
+  );
+
+  const streamLayoutAutoDisabled =
+    typeof process !== "undefined" &&
+    (process.env.NEXT_PUBLIC_EVE_STREAM_LAYOUT_AUTO === "0" ||
+      process.env.NEXT_PUBLIC_EVE_STREAM_LAYOUT_AUTO?.toLowerCase() === "false");
+
+  const isStreamLayout =
+    streamLayoutForced || (!streamLayoutAutoDisabled && streamLayoutAuto);
+  const reduceMotion = useReducedMotion() === true;
   const [addressInput, setAddressInput] = useState(() => defaultRoom.trim());
   const [username, setUsername] = useState(() => streamUsername.trim());
   const [isConnected, setIsConnected] = useState(false);
@@ -529,24 +561,11 @@ export default function PumpfunChatPage({
   const [isAddingVoice, setIsAddingVoice] = useState(false);
 
   const [liveTrendRows, setLiveTrendRows] = useState<LiveTrendRow[]>([]);
-  const [trendsFetchedAt, setTrendsFetchedAt] = useState<string | null>(null);
   const [trendsError, setTrendsError] = useState<string | null>(null);
-  const [voteTally, setVoteTally] = useState<Record<string, number>>({});
-  const voteCooldownRef = useRef<Record<string, number>>({});
-  const [winningTrend, setWinningTrend] = useState<string | null>(null);
   const [speechPulse, setSpeechPulse] = useState(0);
   const [activeTrendHighlight, setActiveTrendHighlight] = useState<
     string | null
   >(null);
-  const [liveSubtitles, setLiveSubtitles] = useState<string>("");
-  const [memorySnapshot, setMemorySnapshot] = useState<MemoryBundle | null>(
-    null,
-  );
-  const [lastDecision, setLastDecision] = useState<TurnDecision | null>(null);
-  const [lastQuality, setLastQuality] = useState<QualityScores | null>(null);
-  const [replaySummary, setReplaySummary] = useState<ReplaySummaryView | null>(null);
-  const [replayRunning, setReplayRunning] = useState(false);
-  const [replayError, setReplayError] = useState<string | null>(null);
   const [tuningProfileId, setTuningProfileId] = useState<TuningProfileId>("normal");
   const tuningProfile = useMemo(
     () => TUNING_MATRIX[tuningProfileId] ?? TUNING_MATRIX.normal,
@@ -560,15 +579,17 @@ export default function PumpfunChatPage({
     bufferCtxStartTime: number | null;
     htmlAudio: HTMLAudioElement | null;
   } | null>(null);
-  const subtitleScheduleRef = useRef<{
-    events: VoiceTimelineEvent[];
-    mode: "buffer" | "html";
-    bufferCtxStartTime: number | null;
-    htmlAudio: HTMLAudioElement | null;
-  } | null>(null);
   const lastSyncedHighlightRef = useRef<string | null>(null);
+  const trendHighlightLingerTimeoutRef = useRef<number | null>(null);
 
-  const voteOptionsRef = useRef<string[]>([]);
+  const clearTrendHighlightLinger = () => {
+    const t = trendHighlightLingerTimeoutRef.current;
+    if (t != null) {
+      clearTimeout(t);
+      trendHighlightLingerTimeoutRef.current = null;
+    }
+  };
+
   const dedupedRef = useRef<DedupedTrend[]>([]);
   const trendTickGuardRef = useRef({
     lastTop: null as string | null,
@@ -581,9 +602,6 @@ export default function PumpfunChatPage({
   const lastTrendCommentaryAtRef = useRef(0);
   const rotatingTrendCursorRef = useRef(0);
   const recentTrendFocusRef = useRef<string[]>([]);
-  const voteLeaderPrevRef = useRef<string | null>(null);
-  const lastVoteSummaryAtRef = useRef(0);
-  const winnerAnnouncedRef = useRef(false);
   /** Last time a real chatter sent a non-spam, non-vote message (for host banter decay). */
   const lastRealChatAtRef = useRef(Date.now());
   const hostBanterGuardRef = useRef({ lastAt: Date.now() });
@@ -592,6 +610,8 @@ export default function PumpfunChatPage({
   const proactiveQueueRef = useRef<ProactiveQueueItem[]>([]);
   /** Last successful agent TTS line (say) for continuity. */
   const lastAgentSpokenRef = useRef<string | null>(null);
+  /** Last radar highlight trend from API — server avoids repeating the same spotlight. */
+  const lastAgentHighlightTrendRef = useRef<string | null>(null);
   /** Increments each agent call for server-side style rotation. */
   const varietySeedRef = useRef(0);
   /**
@@ -612,7 +632,7 @@ export default function PumpfunChatPage({
     () => dedupeTrendsByName(liveTrendRows),
     [liveTrendRows],
   );
-  /** Polar scatter from deduped trends; full deduped list still drives votes. */
+  /** Polar scatter from deduped trends. */
   const trendPolarData = useMemo(
     () =>
       buildTrendPolarScatterData(liveTrendsDeduped, {
@@ -620,6 +640,38 @@ export default function PumpfunChatPage({
       }),
     [liveTrendsDeduped],
   );
+
+  /** Same as radar “new” styling — diff vs prior poll; agent prioritizes these. */
+  const newTrendNamesFromRadar = useMemo(() => {
+    const pts = trendPolarData?.points;
+    if (!pts?.length) return [];
+    return pts
+      .filter((p) => p.change === "new")
+      .map((p) => p.trend_name);
+  }, [trendPolarData]);
+
+  const newTrendNamesRef = useRef<string[]>([]);
+  useEffect(() => {
+    newTrendNamesRef.current = newTrendNamesFromRadar;
+  }, [newTrendNamesFromRadar]);
+
+  const lastNewRadarSpeechFingerprintRef = useRef<string>("");
+  const lastNewRadarSpeechAtRef = useRef<number>(0);
+  /** LIVE MINDSHARE trend names already referenced in Eve replies this session (substring match). */
+  const mentionedTrendsRef = useRef<string[]>([]);
+
+  const streamHeroTrend = useMemo(() => {
+    const pts = trendPolarData?.points;
+    if (!pts?.length) return null;
+    const sorted = [...pts].sort((a, b) => b.maxHeat - a.maxHeat);
+    const top = sorted[0];
+    if (!top) return null;
+    const origIdx = pts.findIndex((p) => p.trend_name === top.trend_name);
+    return {
+      name: top.trend_name,
+      color: streamTrendColor(top.trend_name, Math.max(0, origIdx)),
+    };
+  }, [trendPolarData]);
 
   const radarVoiceBonding = useMemo(() => {
     const progress = isBondedToken
@@ -633,26 +685,6 @@ export default function PumpfunChatPage({
       bondingHasData && progress !== null ? progress / 100 : 0;
     return { progress, bondingHasData, progressNorm };
   }, [isBondedToken, bondingCurveData]);
-
-  const voteGoal = Math.max(
-    3,
-    Number(
-      typeof process !== "undefined"
-        ? process.env.NEXT_PUBLIC_EVE_VOTE_GOAL
-        : undefined,
-    ) || VOTE_GOAL_DEFAULT,
-  );
-
-  const voteLeader = useMemo(() => {
-    const e = Object.entries(voteTally).sort((a, b) => b[1] - a[1]);
-    return e[0]?.[0] ?? null;
-  }, [voteTally]);
-
-  const top3Votes = useMemo(() => {
-    return Object.entries(voteTally)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 3);
-  }, [voteTally]);
 
   const handleAddVoice = async () => {
     if (!newVoiceName || !newVoiceUrl) return;
@@ -675,7 +707,7 @@ export default function PumpfunChatPage({
   // Message Status State
   const [messageStatuses, setMessageStatuses] = useState<Record<string, 'processing' | 'answered' | 'history'>>({});
   const [aiReplies, setAiReplies] = useState<Record<string, string>>({});
-  /** Synthetic agent triggers (radar / host / vote) appended to chat UI while Eve speaks. */
+  /** Synthetic agent triggers (radar / host) appended to chat UI while Eve speaks. */
   const [agentEphemeralRow, setAgentEphemeralRow] = useState<IMessage | null>(
     null,
   );
@@ -709,12 +741,6 @@ export default function PumpfunChatPage({
   }, []);
 
   useEffect(() => {
-    voteOptionsRef.current = liveTrendsDeduped
-      .slice(0, 20)
-      .map((d) => d.trend_name);
-  }, [liveTrendsDeduped]);
-
-  useEffect(() => {
     dedupedRef.current = liveTrendsDeduped;
   }, [liveTrendsDeduped]);
 
@@ -722,7 +748,7 @@ export default function PumpfunChatPage({
     const last = messages[messages.length - 1];
     if (!last) return;
     const u = (last.username || "").trim().toLowerCase();
-    if (["trendradar", "votebooth", "hostfill", "eve"].includes(u)) return;
+    if (["trendradar", "hostfill", "eve"].includes(u)) return;
     const text = last.message.trim();
     if (text.length <= 3) return;
     if (isVoteOnlyMessage(text)) return;
@@ -765,7 +791,6 @@ export default function PumpfunChatPage({
             }
           }
           setLiveTrendRows(j.trends);
-          setTrendsFetchedAt(j.fetchedAt ?? new Date().toISOString());
           setTrendsError(null);
         } else {
           setTrendsError(
@@ -844,42 +869,14 @@ export default function PumpfunChatPage({
           }
         }
       }
-      if (next !== lastSyncedHighlightRef.current) {
+      /* Keep last trend during gaps between segments — do not clear to null mid-utterance. */
+      if (
+        next != null &&
+        next !== lastSyncedHighlightRef.current
+      ) {
         lastSyncedHighlightRef.current = next;
         setActiveTrendHighlight(next);
       }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [isPlayingTTS]);
-
-  useEffect(() => {
-    if (!isPlayingTTS) return;
-    let raf = 0;
-    const tick = () => {
-      const sch = subtitleScheduleRef.current;
-      let elapsed = -1;
-      if (sch?.mode === "html" && sch.htmlAudio) {
-        elapsed = sch.htmlAudio.currentTime;
-      } else if (
-        sch?.mode === "buffer" &&
-        audioContextRef.current &&
-        sch.bufferCtxStartTime != null
-      ) {
-        elapsed = audioContextRef.current.currentTime - sch.bufferCtxStartTime;
-      }
-      let nextText = "";
-      if (elapsed >= 0 && sch?.events?.length) {
-        for (const ev of sch.events) {
-          if (ev.type !== "subtitle_chunk") continue;
-          if (elapsed >= ev.startSec && elapsed <= ev.endSec) {
-            nextText = ev.text;
-            break;
-          }
-        }
-      }
-      setLiveSubtitles((prev) => (prev === nextText ? prev : nextText));
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -925,6 +922,62 @@ export default function PumpfunChatPage({
   }, [addressInput]);
 
   useEffect(() => {
+    if (
+      !isConnected ||
+      !currentTokenAddress ||
+      currentTokenAddress === "unknown" ||
+      !SOLANA_MINT_ADDRESS_RE.test(currentTokenAddress)
+    ) {
+      return;
+    }
+    void fetch("/api/stream/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        mint: currentTokenAddress,
+        displayName: streamName.trim() || undefined,
+        ticker: streamSymbol.trim() || undefined,
+      }),
+    }).catch(() => {});
+  }, [isConnected, currentTokenAddress, streamName, streamSymbol]);
+
+  useEffect(() => {
+    if (
+      !isConnected ||
+      !currentTokenAddress ||
+      currentTokenAddress === "unknown" ||
+      !SOLANA_MINT_ADDRESS_RE.test(currentTokenAddress)
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const r = await fetch(
+          `/api/stream/${encodeURIComponent(currentTokenAddress)}/config`,
+        );
+        const d = (await r.json()) as { tuningProfileId?: string };
+        if (cancelled || !d.tuningProfileId) return;
+        if (
+          d.tuningProfileId === "quiet" ||
+          d.tuningProfileId === "normal" ||
+          d.tuningProfileId === "high_traffic"
+        ) {
+          setTuningProfileId(d.tuningProfileId);
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    void pull();
+    const id = window.setInterval(pull, 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [isConnected, currentTokenAddress]);
+
+  useEffect(() => {
     return () => {
       if (clientRef.current) {
         clientRef.current.close();
@@ -949,8 +1002,7 @@ export default function PumpfunChatPage({
     solUsdPrice,
     historicalPriceData,
     liveTrendsDeduped,
-    voteTally,
-    voteLeader,
+    newTrendNamesFromRadar,
     aiReplies,
   });
   useEffect(() => {
@@ -965,8 +1017,7 @@ export default function PumpfunChatPage({
       solUsdPrice,
       historicalPriceData,
       liveTrendsDeduped,
-      voteTally,
-      voteLeader,
+      newTrendNamesFromRadar,
       aiReplies,
     };
   }, [
@@ -980,8 +1031,7 @@ export default function PumpfunChatPage({
     solUsdPrice,
     historicalPriceData,
     liveTrendsDeduped,
-    voteTally,
-    voteLeader,
+    newTrendNamesFromRadar,
     aiReplies,
   ]);
 
@@ -1208,6 +1258,7 @@ export default function PumpfunChatPage({
       stateRefs.current.aiReplies,
     );
     const lastAgentSay = lastAgentSpokenRef.current;
+    const lastAgentHighlightTrend = lastAgentHighlightTrendRef.current;
 
     setActiveMessageId(msgToProcess.id);
     setIsPlayingTTS(true);
@@ -1288,11 +1339,12 @@ export default function PumpfunChatPage({
             skipTTS: useHF,
             agentMode,
             liveTrendsDeduped: stateRefs.current.liveTrendsDeduped,
-            voteTally: stateRefs.current.voteTally,
-            voteLeader: stateRefs.current.voteLeader,
+            newTrendNamesFromRadar: stateRefs.current.newTrendNamesFromRadar,
+            recentlyMentionedTrendNames: mentionedTrendsRef.current,
             activeTrendSpeaking: activeSpeak,
             recentChatTranscript: recentChatTranscript ?? undefined,
             lastAgentSay: lastAgentSay ?? undefined,
+            lastAgentHighlightTrend: lastAgentHighlightTrend ?? undefined,
             varietySeed,
           }),
         });
@@ -1307,9 +1359,6 @@ export default function PumpfunChatPage({
         highlightTrendName?: string | null;
         highlightTimeline?: unknown;
         events?: VoiceTimelineEvent[];
-        memory?: MemoryBundle;
-        decision?: TurnDecision;
-        quality?: QualityScores;
       };
       try {
         data = await res.json();
@@ -1327,9 +1376,22 @@ export default function PumpfunChatPage({
       const replyText = data.text ?? "";
       if (replyText.trim()) lastAgentSpokenRef.current = replyText.trim();
       setAiReplies((prev) => ({ ...prev, [msgToProcess.id]: replyText }));
-      setMemorySnapshot(data.memory ?? null);
-      setLastDecision(data.decision ?? null);
-      setLastQuality(data.quality ?? null);
+
+      const fromReply = collectMentionedTrendsFromReply(
+        replyText,
+        stateRefs.current.liveTrendsDeduped,
+      );
+      if (fromReply.length) {
+        const seen = new Set<string>();
+        const merged: string[] = [];
+        for (const name of [...fromReply, ...mentionedTrendsRef.current]) {
+          const k = normalizeTrendKey(name);
+          if (seen.has(k)) continue;
+          seen.add(k);
+          merged.push(name);
+        }
+        mentionedTrendsRef.current = merged.slice(0, 20);
+      }
 
       const apiHighlight =
         typeof data.highlightTrendName === "string" &&
@@ -1349,15 +1411,9 @@ export default function PumpfunChatPage({
           stateRefs.current.liveTrendsDeduped,
         );
       }
+      lastAgentHighlightTrendRef.current = highlightForSpeech ?? null;
 
       let voiceHighlightTimeline: VoiceHighlightSegment[] = [];
-      const subtitleEvents: VoiceTimelineEvent[] = Array.isArray(data.events)
-        ? data.events.filter((e): e is VoiceTimelineEvent =>
-            !!e &&
-            typeof e === "object" &&
-            typeof (e as VoiceTimelineEvent).type === "string",
-          )
-        : [];
       const tlRaw = data.highlightTimeline;
       if (Array.isArray(tlRaw)) {
         for (const x of tlRaw) {
@@ -1377,11 +1433,11 @@ export default function PumpfunChatPage({
         }
       }
 
+      clearTrendHighlightLinger();
+      ttsHighlightScheduleRef.current = null;
+      /* UI highlight follows voice timeline only — RAF sets this when the playhead hits a segment. */
       setActiveTrendHighlight(null);
       lastSyncedHighlightRef.current = null;
-      ttsHighlightScheduleRef.current = null;
-      subtitleScheduleRef.current = null;
-      setLiveSubtitles("");
 
       let audioUrl = data.audio;
       if (useHF && replyText) {
@@ -1413,16 +1469,18 @@ export default function PumpfunChatPage({
       }
 
       const finishSpeechUi = () => {
+        clearTrendHighlightLinger();
         audioAnalyzerRef.current = null;
         ttsHighlightScheduleRef.current = null;
-        subtitleScheduleRef.current = null;
         lastSyncedHighlightRef.current = null;
-        setActiveTrendHighlight(null);
-        setLiveSubtitles("");
         setIsPlayingTTS(false);
         setActiveMessageId(null);
         setHfStatus(null);
         setAgentEphemeralRow(null);
+        trendHighlightLingerTimeoutRef.current = window.setTimeout(() => {
+          trendHighlightLingerTimeoutRef.current = null;
+          setActiveTrendHighlight(null);
+        }, TREND_HIGHLIGHT_READ_LINGER_MS);
       };
 
       const markAnswered = () =>
@@ -1514,6 +1572,16 @@ export default function PumpfunChatPage({
                 (raw) => resolveTrendCanon(raw) ?? raw,
               );
             }
+            /** Model/API highlight without full title in speech — align to best partial phrase, not t=0. */
+            if (timeline.length === 0 && highlightForSpeech?.trim()) {
+              timeline = buildTimelineForTrendMention(
+                replyText,
+                highlightForSpeech.trim(),
+                audioBuffer.duration,
+                VOICE_HIGHLIGHT_LINGER_SEC,
+                (raw) => resolveTrendCanon(raw) ?? raw,
+              );
+            }
 
             const source = ctx.createBufferSource();
             source.buffer = audioBuffer;
@@ -1541,25 +1609,8 @@ export default function PumpfunChatPage({
             };
             const tWhen = ctx.currentTime;
             source.start(tWhen);
-            const subtitleTimeline =
-              subtitleEvents.length > 0
-                ? subtitleEvents
-                : ([
-                    {
-                      type: "subtitle_chunk",
-                      startSec: 0,
-                      endSec: Math.max(2, Math.min(20, audioBuffer.duration)),
-                      text: replyText,
-                    },
-                  ] as VoiceTimelineEvent[]);
             ttsHighlightScheduleRef.current = {
               segments: timeline,
-              mode: "buffer",
-              bufferCtxStartTime: tWhen,
-              htmlAudio: null,
-            };
-            subtitleScheduleRef.current = {
-              events: subtitleTimeline,
               mode: "buffer",
               bufferCtxStartTime: tWhen,
               htmlAudio: null,
@@ -1580,37 +1631,30 @@ export default function PumpfunChatPage({
             finishSpeechUi();
           };
           let htmlTimeline = voiceHighlightTimeline;
+          const htmlDurGuess = Math.min(
+            120,
+            Math.max(5, replyText.length * 0.052),
+          );
           if (htmlTimeline.length === 0 && replyText.trim() && trends.length > 0) {
-            const durGuess = Math.min(
-              120,
-              Math.max(5, replyText.length * 0.052),
-            );
             htmlTimeline = buildProportionalHighlightTimeline(
               replyText,
               trends.map((t) => t.trend_name),
-              durGuess,
+              htmlDurGuess,
+              VOICE_HIGHLIGHT_LINGER_SEC,
+              (raw) => resolveTrendCanon(raw) ?? raw,
+            );
+          }
+          if (htmlTimeline.length === 0 && highlightForSpeech?.trim()) {
+            htmlTimeline = buildTimelineForTrendMention(
+              replyText,
+              highlightForSpeech.trim(),
+              htmlDurGuess,
               VOICE_HIGHLIGHT_LINGER_SEC,
               (raw) => resolveTrendCanon(raw) ?? raw,
             );
           }
           ttsHighlightScheduleRef.current = {
             segments: htmlTimeline,
-            mode: "html",
-            bufferCtxStartTime: null,
-            htmlAudio: audio,
-          };
-          subtitleScheduleRef.current = {
-            events:
-              subtitleEvents.length > 0
-                ? subtitleEvents
-                : ([
-                    {
-                      type: "subtitle_chunk",
-                      startSec: 0,
-                      endSec: Math.max(2, Math.min(20, replyText.length * 0.052)),
-                      text: replyText,
-                    },
-                  ] as VoiceTimelineEvent[]),
             mode: "html",
             bufferCtxStartTime: null,
             htmlAudio: audio,
@@ -1625,6 +1669,7 @@ export default function PumpfunChatPage({
             console.warn("HTML Audio playback failed", playErr);
             setIsPlayingTTS(false);
             setHfStatus(null);
+            clearTrendHighlightLinger();
             setActiveTrendHighlight(null);
             setAgentEphemeralRow(null);
             setError(
@@ -1634,13 +1679,22 @@ export default function PumpfunChatPage({
           }
         }
       } else {
-        if (highlightForSpeech) setActiveTrendHighlight(highlightForSpeech);
-        setTimeout(() => {
-          setActiveTrendHighlight(null);
+        clearTrendHighlightLinger();
+        setActiveTrendHighlight(null);
+        const noAudioHighlightTimer = window.setTimeout(() => {
+          if (highlightForSpeech) setActiveTrendHighlight(highlightForSpeech);
+        }, NO_AUDIO_TREND_HIGHLIGHT_DELAY_MS);
+        window.setTimeout(() => {
+          window.clearTimeout(noAudioHighlightTimer);
           setIsPlayingTTS(false);
           setActiveMessageId(null);
           setHfStatus(null);
           setAgentEphemeralRow(null);
+          clearTrendHighlightLinger();
+          trendHighlightLingerTimeoutRef.current = window.setTimeout(() => {
+            trendHighlightLingerTimeoutRef.current = null;
+            setActiveTrendHighlight(null);
+          }, TREND_HIGHLIGHT_READ_LINGER_MS);
         }, 6000);
         setMessageStatuses((prev) => ({
           ...prev,
@@ -1658,6 +1712,7 @@ export default function PumpfunChatPage({
       console.error("Agent interaction failed", error);
       ttsHighlightScheduleRef.current = null;
       lastSyncedHighlightRef.current = null;
+      clearTrendHighlightLinger();
       setActiveTrendHighlight(null);
       const msg =
         error instanceof Error && error.name === "AbortError"
@@ -1687,6 +1742,76 @@ export default function PumpfunChatPage({
     triggerAgentRef.current = triggerAgent;
   }, [triggerAgent]);
 
+  /** Proactive turn when polar marks trend(s) as new — speak about top 1–2 by heat (not only on leaderboard churn). */
+  useEffect(() => {
+    if (!isConnected) return;
+    if (!newTrendNamesFromRadar.length) return;
+
+    const topNew = newTrendNamesFromRadar.slice(0, NEW_RADAR_SPEECH_MAX_NAMES);
+    const fingerprint = topNew.map((n) => normalizeTrendKey(n)).join("|");
+    if (fingerprint === lastNewRadarSpeechFingerprintRef.current) return;
+
+    const now = Date.now();
+    if (
+      lastNewRadarSpeechAtRef.current > 0 &&
+      now - lastNewRadarSpeechAtRef.current < NEW_RADAR_SPEECH_MIN_GAP_MS
+    ) {
+      return;
+    }
+
+    lastNewRadarSpeechFingerprintRef.current = fingerprint;
+    lastNewRadarSpeechAtRef.current = now;
+
+    const primary = topNew[0]!;
+    const label =
+      topNew.length === 1
+        ? `"${primary}"`
+        : `"${primary}" and "${topNew[1]}"`;
+
+    const msg = syntheticAgentMessage({
+      id: `new-radar-${now}`,
+      message: `Voice cue: NEW ON RADAR — ${label} just surfaced (heat-ranked). Mention these by exact name; if both, keep it tight.`,
+      username: "TrendRadar",
+    });
+
+    if (stateRefs.current.isPlayingTTS) {
+      pushProactiveQueue(proactiveQueueRef, {
+        msg,
+        opts: { agentMode: "trend_tick", activeTrendSpeaking: primary },
+        createdAt: now,
+        expiresAt: now + 2 * 60_000,
+        priority: 11,
+        reason: "new_radar",
+      });
+      if (process.env.NODE_ENV === "development") {
+        console.debug("[new-radar] queued (tts busy)", { topNew });
+      }
+      return;
+    }
+
+    void triggerAgentRef.current(msg, {
+      agentMode: "trend_tick",
+      activeTrendSpeaking: primary,
+    }).then((started) => {
+      if (!started) {
+        pushProactiveQueue(proactiveQueueRef, {
+          msg,
+          opts: { agentMode: "trend_tick", activeTrendSpeaking: primary },
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 2 * 60_000,
+          priority: 11,
+          reason: "tts_busy",
+        });
+        metric("proactive_skip_tts_busy_total");
+        return;
+      }
+      metric("proactive_fired_total");
+      if (process.env.NODE_ENV === "development") {
+        console.debug("[new-radar] fired", { topNew });
+      }
+    });
+  }, [isConnected, newTrendNamesFromRadar]);
+
   /** Last-resort reset if a run hangs without ever calling finishSpeechUi. */
   useEffect(() => {
     if (!isPlayingTTS) return;
@@ -1698,15 +1823,14 @@ export default function PumpfunChatPage({
       );
       audioAnalyzerRef.current = null;
       ttsHighlightScheduleRef.current = null;
-      subtitleScheduleRef.current = null;
       lastSyncedHighlightRef.current = null;
       setIsPlayingTTS(false);
       setActiveMessageId(null);
       setHfStatus(null);
-      setActiveTrendHighlight(null);
-      setLiveSubtitles("");
       setAgentEphemeralRow(null);
       proactiveQueueRef.current = [];
+      clearTrendHighlightLinger();
+      setActiveTrendHighlight(null);
     }, TTS_STUCK_WATCHDOG_MS);
     return () => window.clearTimeout(id);
   }, [isPlayingTTS]);
@@ -1811,12 +1935,19 @@ export default function PumpfunChatPage({
         recentTrendFocusRef.current,
         rotatingTrendCursorRef.current,
       );
-      const focusTrend =
+      let focusTrend =
         selected.trend &&
         !trendDisplayNamesMatch(selected.trend.trend_name, g.lastTop)
           ? selected.trend
           : preferred;
       rotatingTrendCursorRef.current = selected.nextCursor;
+      const freshRadar = newTrendNamesRef.current;
+      if (freshRadar.length > 0) {
+        const hitNew = d.find((x) =>
+          freshRadar.some((n) => trendDisplayNamesMatch(x.trend_name, n)),
+        );
+        if (hitNew) focusTrend = hitNew;
+      }
       if (!focusTrend) return;
 
       const trendTickMsg = syntheticAgentMessage({
@@ -1899,7 +2030,14 @@ export default function PumpfunChatPage({
         rotatingTrendCursorRef.current,
       );
       rotatingTrendCursorRef.current = selected.nextCursor;
-      const focusTrend = selected.trend?.trend_name ?? d[0]?.trend_name ?? null;
+      let focusTrend = selected.trend?.trend_name ?? d[0]?.trend_name ?? null;
+      const freshRadar = newTrendNamesRef.current;
+      if (freshRadar.length > 0) {
+        const hitNew = d.find((x) =>
+          freshRadar.some((n) => trendDisplayNamesMatch(x.trend_name, n)),
+        );
+        if (hitNew) focusTrend = hitNew.trend_name;
+      }
 
       const hostMsg = syntheticAgentMessage({
         id: `host-banter-${now}`,
@@ -1950,50 +2088,6 @@ export default function PumpfunChatPage({
     }, tuningProfile.hostCheckMs);
     return () => window.clearInterval(id);
   }, [isConnected, tuningProfile]);
-
-  useEffect(() => {
-    for (const [name, n] of Object.entries(voteTally)) {
-      if (n >= voteGoal && !winnerAnnouncedRef.current) {
-        winnerAnnouncedRef.current = true;
-        setWinningTrend(name);
-        void triggerAgentRef.current(
-          syntheticAgentMessage({
-            id: `winner-${Date.now()}`,
-            message: `[Stream: "${name}" hit ${voteGoal} votes and wins this voting round. Celebrate the pick and hype the room in two short sentences.]`,
-            username: "VoteBooth",
-          }),
-          { agentMode: "chat_reply", activeTrendSpeaking: name },
-        );
-        break;
-      }
-    }
-  }, [voteTally, voteGoal]);
-
-  useEffect(() => {
-    if (!isConnected || !voteLeader) return;
-    const total = Object.values(voteTally).reduce((s, x) => s + x, 0);
-    if (total < 3) return;
-    const prev = voteLeaderPrevRef.current;
-    if (prev === voteLeader) return;
-    if (prev !== null) {
-      const now = Date.now();
-      if (
-        now - lastVoteSummaryAtRef.current >= VOTE_SUMMARY_COOLDOWN_MS &&
-        !stateRefs.current.isPlayingTTS
-      ) {
-        lastVoteSummaryAtRef.current = now;
-        void triggerAgentRef.current(
-          syntheticAgentMessage({
-            id: `vote-sum-${now}`,
-            message: "Voice cue: vote standings update.",
-            username: "VoteBooth",
-          }),
-          { agentMode: "vote_summary" },
-        );
-      }
-    }
-    voteLeaderPrevRef.current = voteLeader;
-  }, [voteLeader, voteTally, isConnected]);
 
   useEffect(() => {
     if (!isConnected) return;
@@ -2131,9 +2225,14 @@ export default function PumpfunChatPage({
           } else if (parsed.type === 'messageHistory') {
             clearConnectHandshakeTimer();
             setMessages((prev) => {
-              if (!isReconnect || prev.length === 0) return parsed.data || [];
+              const raw = Array.isArray(parsed.data) ? parsed.data : [];
+              const historyFiltered = raw.filter((m: IMessage) => {
+                const t = (m?.message || "").trim();
+                return !t || !isPumpSpamScamMessage(t);
+              });
+              if (!isReconnect || prev.length === 0) return historyFiltered;
               const existingIds = new Set(prev.map(m => m.id));
-              const newHistoryMessages = (parsed.data || []).filter((m: any) => m.id && !existingIds.has(m.id));
+              const newHistoryMessages = historyFiltered.filter((m: IMessage) => m.id && !existingIds.has(m.id));
               const combined = [...prev, ...newHistoryMessages];
               if (combined.length > 100) return combined.slice(-100);
               return combined;
@@ -2142,22 +2241,9 @@ export default function PumpfunChatPage({
           } else if (parsed.type === "message") {
             clearConnectHandshakeTimer();
             const msg = parsed.data as IMessage;
-            if (isVoteOnlyMessage(msg.message)) {
-              const v = parseChatVote(msg.message, voteOptionsRef.current);
-              if (v) {
-                const uid = (msg.username || "anon").toLowerCase();
-                const now = Date.now();
-                if (
-                  now - (voteCooldownRef.current[uid] ?? 0) >=
-                  VOTE_COOLDOWN_MS
-                ) {
-                  voteCooldownRef.current[uid] = now;
-                  setVoteTally((vt) => ({
-                    ...vt,
-                    [v.key]: (vt[v.key] ?? 0) + 1,
-                  }));
-                }
-              }
+            const incomingText = (msg.message || "").trim();
+            if (incomingText && isPumpSpamScamMessage(incomingText)) {
+              return;
             }
             setMessages((prev) => {
               if (msg.id && prev.some((m) => m.id === msg.id)) return prev;
@@ -2228,31 +2314,6 @@ export default function PumpfunChatPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- run once when default room is present; handleConnect stable enough for initial connect
   }, [addressInput, autoConnect]);
 
-  const runReplaySample = useCallback(async () => {
-    setReplayRunning(true);
-    setReplayError(null);
-    try {
-      const res = await fetch("/api/agent/replay", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ datasetPath: "data/replay/sample.jsonl" }),
-      });
-      const data = (await res.json()) as {
-        ok?: boolean;
-        summary?: ReplaySummaryView;
-        error?: string;
-      };
-      if (!res.ok || !data.ok || !data.summary) {
-        throw new Error(data.error || "Replay run failed");
-      }
-      setReplaySummary(data.summary);
-    } catch (error: unknown) {
-      setReplayError(error instanceof Error ? error.message : "Replay run failed");
-    } finally {
-      setReplayRunning(false);
-    }
-  }, []);
-
   const handleDisconnect = () => {
     if (connectHandshakeTimerRef.current != null) {
       window.clearTimeout(connectHandshakeTimerRef.current);
@@ -2279,11 +2340,9 @@ export default function PumpfunChatPage({
     setIsBondedToken(false);
     setPriceHistory([]);
     setHistoricalPriceData(null);
-    setVoteTally({});
-    voteCooldownRef.current = {};
-    setWinningTrend(null);
-    winnerAnnouncedRef.current = false;
-    voteLeaderPrevRef.current = null;
+    lastNewRadarSpeechFingerprintRef.current = "";
+    lastNewRadarSpeechAtRef.current = 0;
+    mentionedTrendsRef.current = [];
     trendTickGuardRef.current = {
       lastTop: null,
       lastHeat: 0,
@@ -2299,19 +2358,17 @@ export default function PumpfunChatPage({
     lastReactiveSpokenAtRef.current = 0;
     lastProactiveSpokenAtRef.current = 0;
     ttsHighlightScheduleRef.current = null;
-    subtitleScheduleRef.current = null;
     lastSyncedHighlightRef.current = null;
+    const linger = trendHighlightLingerTimeoutRef.current;
+    if (linger != null) {
+      clearTimeout(linger);
+      trendHighlightLingerTimeoutRef.current = null;
+    }
     setActiveTrendHighlight(null);
-    setLiveSubtitles("");
-    setMemorySnapshot(null);
-    setLastDecision(null);
-    setLastQuality(null);
-    setReplaySummary(null);
-    setReplayRunning(false);
-    setReplayError(null);
     setError(null);
     setConnectionNotice(null);
     lastAgentSpokenRef.current = null;
+    lastAgentHighlightTrendRef.current = null;
     varietySeedRef.current = 0;
     // messageStatuses and aiReplies intentionally kept to persist data
   };
@@ -2331,27 +2388,75 @@ export default function PumpfunChatPage({
   }, [priceHistory]);
 
   return (
-    <div className="h-dvh bg-[#050508] text-white flex flex-col font-sans selection:bg-cyan-500/30 overflow-hidden">
-      {/* Full-bleed background */}
+    <div className="h-dvh flex flex-col font-sans overflow-hidden text-[color:var(--eve-text)] selection:bg-[color-mix(in_srgb,var(--eve-accent-a)_35%,transparent)]">
+      {/* Full-bleed broadcast background */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none z-0">
-        <div className="absolute top-0 left-0 right-0 h-[50%] bg-gradient-to-b from-cyan-950/25 via-transparent to-transparent" />
-        <div className="absolute bottom-0 left-0 right-0 h-[50%] bg-gradient-to-t from-fuchsia-950/20 via-transparent to-transparent" />
-        <div className="absolute top-[-15%] left-[-5%] w-[50%] h-[50%] bg-cyan-600/15 blur-[140px] rounded-full" />
-        <div className="absolute bottom-[-15%] right-[-5%] w-[50%] h-[50%] bg-fuchsia-600/15 blur-[140px] rounded-full" />
+        <div className="absolute inset-0 bg-[var(--eve-bg-deep)]" />
+        <div className="absolute top-0 left-0 right-0 h-[58%] bg-gradient-to-b from-[color-mix(in_srgb,var(--eve-accent-a)_22%,transparent)] via-transparent to-transparent" />
+        <div className="absolute bottom-0 left-0 right-0 h-[58%] bg-gradient-to-t from-[color-mix(in_srgb,var(--eve-accent-b)_18%,transparent)] via-transparent to-transparent" />
+        <div
+          className="absolute top-[-18%] left-[-10%] w-[58%] h-[58%] rounded-full eve-ambient-mesh bg-[radial-gradient(circle_at_center,var(--eve-glow-a)_0%,transparent_68%)] blur-[130px]"
+          aria-hidden
+        />
+        <div
+          className="absolute bottom-[-18%] right-[-10%] w-[58%] h-[58%] rounded-full eve-ambient-mesh bg-[radial-gradient(circle_at_center,var(--eve-glow-b)_0%,transparent_68%)] blur-[130px]"
+          style={{ animationDelay: "-7s" }}
+          aria-hidden
+        />
+        <div
+          className="absolute inset-0 opacity-[0.055] bg-[linear-gradient(rgba(255,255,255,0.12)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.08)_1px,transparent_1px)] bg-[length:22px_22px]"
+          aria-hidden
+        />
       </div>
 
-      <div className="relative z-10 flex flex-1 min-h-0 flex-col pb-[3.25rem] sm:pb-14">
-      {/* Compact header: branding + connect inline, gradient accent line */}
-      <header className="relative z-20 flex items-center gap-3 sm:gap-4 px-4 sm:px-6 lg:px-8 py-3 bg-black/30 backdrop-blur-xl shrink-0 min-h-[3.25rem]">
-        <div className="absolute bottom-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-cyan-500/40 to-fuchsia-500/40" aria-hidden />
+      <div className={`relative z-10 flex flex-1 min-h-0 flex-col ${isStreamLayout ? "pb-2 sm:pb-2" : "pb-[3.25rem] sm:pb-14"}`}>
+      <motion.header
+        /* initial must not hide content on SSR — opacity:0 produced a blank page without JS */
+        initial={false}
+        animate={{ opacity: 1, y: 0 }}
+        transition={
+          reduceMotion
+            ? { duration: 0 }
+            : { duration: 0.55, ease: [0.22, 1, 0.36, 1] }
+        }
+        className={`relative z-20 flex items-center gap-2 sm:gap-4 px-3 sm:px-6 lg:px-8 ${isStreamLayout ? "py-2 min-h-0" : "py-3 min-h-[3.5rem]"} eve-panel rounded-none border-x-0 border-t-0 shrink-0 border-b-[color:var(--eve-border)] shadow-[0_12px_48px_rgba(0,0,0,0.35)]`}
+      >
+        <div
+          className="absolute bottom-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[color:var(--eve-accent-a)] to-[color:var(--eve-accent-b)] opacity-90"
+          aria-hidden
+        />
         <div className="flex items-center gap-3 min-w-0 flex-1">
-          <img src="/clawk.png" alt="EVE" className="w-10 h-10 rounded-xl object-contain bg-white/5 flex-shrink-0 ring-1 ring-white/10 shadow-sm" />
+          <img
+            src="/clawk.png"
+            alt="EVE"
+            className={`rounded-xl object-contain bg-white/5 flex-shrink-0 ring-2 ring-[color:var(--eve-border)] shadow-[0_0_24px_var(--eve-glow-a)] ${isStreamLayout ? "w-9 h-9" : "w-11 h-11"}`}
+          />
           <div className="min-w-0 flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-3">
-            <h1 className="text-xl sm:text-2xl font-black tracking-tight truncate">
-              <span className="bg-gradient-to-r from-white via-white to-gray-400 bg-clip-text text-transparent">EVE</span>
-              <span className="text-cyan-400 ml-1.5 font-semibold">Trend Analyst</span>
+            <h1
+              className={`eve-display flex flex-wrap items-baseline gap-x-2 gap-y-0 truncate min-w-0 leading-none ${isStreamLayout ? "text-[var(--eve-display-size-stream)]" : "text-[var(--eve-display-size)]"}`}
+            >
+              <span className="relative eve-hero-sweep inline-block overflow-hidden text-white tracking-[0.06em] drop-shadow-[0_0_28px_var(--eve-glow-a)]">
+                EVE
+              </span>
+              {!isStreamLayout ? (
+                <span className="text-[color:var(--eve-accent-a)] font-bold normal-case tracking-normal text-[clamp(0.85rem,2vw,1.15rem)] font-[family-name:var(--font-eve-sans)]">
+                  Trend Analyst
+                </span>
+              ) : (
+                <span className="eve-live-pulse text-[color:var(--eve-live)] font-bold normal-case tracking-wide text-sm sm:text-base font-[family-name:var(--font-eve-sans)]">
+                  LIVE
+                </span>
+              )}
             </h1>
-            {(isBondedToken || (latestMcSol !== null && latestMcSol > 0)) && (
+            {isStreamLayout ? (
+              <span
+                className="ml-1 shrink-0 rounded-md border border-[color:var(--eve-live)]/50 bg-[color-mix(in_srgb,var(--eve-live)_12%,transparent)] px-2 py-0.5 text-[10px] eve-ticker text-[color:var(--eve-live)]"
+                title="Stream layout: per-trend colors, radar-first, top strip. Auto at ≤640×480 viewport, or set NEXT_PUBLIC_EVE_STREAM_LAYOUT=1. Disable auto with NEXT_PUBLIC_EVE_STREAM_LAYOUT_AUTO=0."
+              >
+                Stream
+              </span>
+            ) : null}
+            {!isStreamLayout && (isBondedToken || (latestMcSol !== null && latestMcSol > 0)) && (
               <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 sm:pl-3 sm:border-l border-white/10 text-[11px] sm:text-xs">
                 {isBondedToken && (
                   <span className="font-mono text-cyan-400 uppercase tracking-wider font-semibold shrink-0">Bonded</span>
@@ -2371,7 +2476,7 @@ export default function PumpfunChatPage({
             )}
           </div>
         </div>
-        {mcChartMounted && priceHistory.length > 1 && (
+        {!isStreamLayout && mcChartMounted && priceHistory.length > 1 && (
           <div className="hidden sm:flex flex-col justify-end shrink-0 w-36 h-[52px] border-l border-white/10 pl-3 ml-0.5">
             <p className="text-[9px] font-mono text-gray-500 uppercase tracking-widest mb-0.5 text-right leading-none">
               MC (SOL)
@@ -2413,6 +2518,7 @@ export default function PumpfunChatPage({
           </div>
         )}
         <div className="flex items-center gap-2 sm:gap-3 flex-shrink-0">
+          {!isStreamLayout ? (
           <div className="hidden sm:flex items-center gap-2">
             <select
               value={selectedVoice}
@@ -2458,7 +2564,8 @@ export default function PumpfunChatPage({
               <Volume2 className="w-4 h-4" />
             </button>
           </div>
-          {!isEveKiosk && (
+          ) : null}
+          {!isEveKiosk && !isStreamLayout && (
           <div className="relative hidden sm:block w-48 lg:w-64">
             <LinkIcon className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500 pointer-events-none" />
             <input
@@ -2475,7 +2582,7 @@ export default function PumpfunChatPage({
             <button
               onClick={() => handleConnect(false, { fromUserClick: true })}
               disabled={isConnecting}
-              className="relative py-2.5 px-5 sm:px-6 bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 rounded-xl font-semibold text-white transition-all duration-200 flex items-center justify-center gap-2 overflow-hidden border border-cyan-400/40 hover:border-cyan-300/60 active:scale-[0.98]"
+              className="relative py-2.5 px-5 sm:px-6 bg-gradient-to-r from-[color:var(--eve-accent-a)] to-[color:var(--eve-accent-b)] hover:brightness-110 disabled:opacity-50 disabled:hover:brightness-100 rounded-xl font-extrabold text-black transition-all duration-200 flex items-center justify-center gap-2 overflow-hidden border border-white/20 shadow-[0_0_28px_var(--eve-glow-a)] active:scale-[0.98]"
             >
               <span className="absolute inset-x-0 top-0 h-1/2 bg-gradient-to-b from-white/15 to-transparent rounded-t-xl pointer-events-none opacity-0 hover:opacity-100 transition-opacity duration-200" aria-hidden />
               {isConnecting ? (
@@ -2490,14 +2597,14 @@ export default function PumpfunChatPage({
           ) : (
             <button
               onClick={handleDisconnect}
-              className="py-2.5 px-5 sm:px-6 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 rounded-xl font-semibold text-cyan-400 transition-all flex items-center justify-center gap-2"
+              className="py-2.5 px-5 sm:px-6 bg-[color-mix(in_srgb,var(--eve-accent-a)_14%,transparent)] hover:bg-[color-mix(in_srgb,var(--eve-accent-a)_22%,transparent)] border border-[color:var(--eve-border-strong)] rounded-xl font-bold text-[color:var(--eve-accent-a)] transition-all flex items-center justify-center gap-2 shadow-[0_0_16px_var(--eve-glow-a)]"
             >
               <Square className="w-4 h-4" />
               <span className="hidden sm:inline">Stop</span>
             </button>
           )}
         </div>
-      </header>
+      </motion.header>
 
       {/* Mobile: token input + error below header */}
       {!isEveKiosk && (
@@ -2531,141 +2638,159 @@ export default function PumpfunChatPage({
       )}
 
       {/* Main: full viewport, edge-to-edge; stacks on small screens */}
-      <main className="flex-1 relative z-10 flex flex-col lg:flex-row min-h-0 w-full">
+      <main className="flex-1 relative z-10 flex flex-col lg:flex-row min-h-0 w-full overflow-hidden">
         {/* Visualizer zone - takes most space, no max-width */}
-        <div className="flex-1 min-w-0 flex flex-col relative overflow-hidden border-r border-white/5">
-          <div className="absolute inset-0 bg-gradient-to-br from-cyan-950/20 via-black/40 to-fuchsia-950/10" />
-          <div className="absolute right-0 top-0 bottom-0 w-px bg-gradient-to-b from-transparent via-cyan-500/20 to-transparent pointer-events-none" aria-hidden />
-          {/* Overlay bar: token name, ticker, and connection status (inline so radar height is stable) */}
-          <div className="relative z-10 flex items-center gap-3 sm:gap-4 px-4 sm:px-6 lg:px-8 py-3 min-h-[3rem]">
-            <div className="flex items-center gap-3 sm:gap-4 flex-shrink-0 flex-wrap">
+        <div className="flex-1 min-w-0 min-h-0 flex flex-col relative overflow-hidden border-r border-[color:var(--eve-border)]">
+          <div className="absolute inset-0 bg-gradient-to-br from-[color-mix(in_srgb,var(--eve-accent-a)_12%,transparent)] via-[color-mix(in_srgb,var(--eve-bg-deep)_40%,black)] to-[color-mix(in_srgb,var(--eve-accent-b)_10%,transparent)]" />
+          <div
+            className="absolute right-0 top-0 bottom-0 w-px bg-gradient-to-b from-transparent via-[color:var(--eve-accent-a)]/35 to-[color:var(--eve-accent-b)]/25 pointer-events-none"
+            aria-hidden
+          />
+          {/* Name/ticker: full width when stream; when default layout, desktop grid places this above Latest trends only (Mindshare shares the top row — see inner grid). */}
+          {isStreamLayout ? (
+          <div className="relative z-10 flex flex-wrap items-center gap-2 sm:gap-4 px-3 sm:px-6 lg:px-8 py-1.5 min-h-0">
+            <div className="flex min-w-0 flex-shrink-0 flex-wrap items-center gap-2 sm:gap-4">
               <input
                 type="text"
                 placeholder="Token name"
                 value={streamName}
                 onChange={e => setStreamName(e.target.value)}
-                className="bg-transparent text-lg sm:text-xl font-bold text-white placeholder:text-gray-500 border-b border-transparent hover:border-white/20 focus:border-cyan-500/60 focus:outline-none transition-colors w-32 sm:w-44"
+                className="bg-transparent font-bold text-white placeholder:text-gray-500 border-b border-transparent hover:border-white/20 focus:border-cyan-500/60 focus:outline-none transition-colors text-sm w-28 sm:w-36"
               />
-              <span className="text-sm px-2 py-1 bg-white/10 text-gray-300 rounded font-mono">
+              <span className="px-2 py-0.5 bg-white/10 text-gray-300 rounded font-mono text-xs">
                 $ <input
                   type="text"
                   placeholder="TICKER"
                   value={streamSymbol}
                   onChange={e => setStreamSymbol(e.target.value.toUpperCase())}
-                  className="bg-transparent w-16 sm:w-20 focus:outline-none placeholder:text-gray-500 font-mono"
+                  className="bg-transparent focus:outline-none placeholder:text-gray-500 font-mono w-12 sm:w-14 text-xs"
                 />
               </span>
             </div>
-            <div className="flex-1 min-w-0 flex items-center justify-end self-center">
-              <div className="flex items-center gap-2 sm:gap-3 max-w-full">
-                <label className="text-[10px] sm:text-xs text-zinc-400 uppercase tracking-wider">
-                  Autonomy
-                </label>
-                <select
-                  value={tuningProfileId}
-                  onChange={(e) => setTuningProfileId(e.target.value as TuningProfileId)}
-                  className="bg-black/40 border border-white/15 rounded px-2 py-1 text-[11px] sm:text-xs text-zinc-200"
-                >
-                  <option value="quiet">Quiet Room</option>
-                  <option value="normal">Normal Room</option>
-                  <option value="high_traffic">High Traffic</option>
-                </select>
-                {connectionNotice ? (
-                  <span
-                    className="text-xs sm:text-sm text-amber-400/95 tabular-nums text-right truncate max-w-[44vw]"
-                    title={connectionNotice}
-                  >
-                    {connectionNotice}
-                  </span>
-                ) : null}
-              </div>
-            </div>
           </div>
+          ) : null}
 
-          {(isConnected || liveSubtitles || lastDecision || memorySnapshot || lastQuality || replaySummary || replayError || replayRunning) && (
-            <div className="relative z-10 px-4 sm:px-6 lg:px-8 pb-2 space-y-2">
-              {liveSubtitles ? (
-                <div className="px-3 py-2 rounded-lg border border-cyan-500/30 bg-cyan-500/10 text-cyan-100 text-sm leading-snug">
-                  {liveSubtitles}
-                </div>
-              ) : null}
-              <div className="grid grid-cols-1 lg:grid-cols-4 gap-2">
-                <div className="rounded-lg border border-white/10 bg-black/25 px-3 py-2">
-                  <p className="text-[10px] uppercase tracking-wider text-zinc-400">
-                    Turn Rationale
-                  </p>
-                  <p className="text-xs text-zinc-200 mt-1">
-                    {lastDecision
-                      ? `${lastDecision.turnKind} / ${lastDecision.intent} · ${lastDecision.reason}`
-                      : "—"}
-                  </p>
-                </div>
-                <div className="rounded-lg border border-white/10 bg-black/25 px-3 py-2">
-                  <p className="text-[10px] uppercase tracking-wider text-zinc-400">
-                    Memory Chips
-                  </p>
-                  <div className="mt-1 flex flex-wrap gap-1.5">
-                    {(memorySnapshot?.longTermFacts ?? []).slice(0, 3).map((f) => (
-                      <span
-                        key={f.key}
-                        className="text-[10px] px-2 py-0.5 rounded-full bg-fuchsia-500/15 border border-fuchsia-500/30 text-fuchsia-200"
-                        title={f.value}
-                      >
-                        {f.value.slice(0, 36)}
-                      </span>
-                    ))}
-                    {(memorySnapshot?.longTermFacts ?? []).length === 0 ? (
-                      <span className="text-xs text-zinc-500">No memory facts yet</span>
-                    ) : null}
-                  </div>
-                </div>
-                <div className="rounded-lg border border-white/10 bg-black/25 px-3 py-2">
-                  <p className="text-[10px] uppercase tracking-wider text-zinc-400">
-                    Quality
-                  </p>
-                  <p className="text-xs text-zinc-200 mt-1">
-                    {lastQuality
-                      ? `d ${lastQuality.directness.toFixed(2)} · r ${lastQuality.relevance.toFixed(2)} · n ${lastQuality.novelty.toFixed(2)}`
-                      : "—"}
-                  </p>
-                </div>
-                <div className="rounded-lg border border-white/10 bg-black/25 px-3 py-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="text-[10px] uppercase tracking-wider text-zinc-400">
-                      Replay
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => void runReplaySample()}
-                      disabled={replayRunning}
-                      className="text-[10px] px-2 py-0.5 rounded border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/10 disabled:opacity-50"
+          <div className="flex-1 flex flex-col min-h-0 overflow-hidden overflow-x-hidden relative z-10">
+            <div
+              className={`flex-1 min-h-0 flex flex-col px-1 sm:px-3 pb-1 pt-0 ${isStreamLayout ? "min-h-0" : ""}`}
+            >
+              {isStreamLayout ? (
+                <div className="flex flex-col flex-1 min-h-0 gap-1.5">
+                  {streamHeroTrend ? (
+                    <motion.div
+                      key={streamHeroTrend.name}
+                      layout={!reduceMotion}
+                      initial={false}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={
+                        reduceMotion
+                          ? { duration: 0 }
+                          : { type: "spring", stiffness: 380, damping: 28 }
+                      }
+                      className="shrink-0 px-2 py-0.5 text-center border-b border-[color:var(--eve-border)]/80"
                     >
-                      {replayRunning ? "Running..." : "Run sample"}
-                    </button>
-                  </div>
-                  <p className="text-xs text-zinc-200 mt-1">
-                    {replaySummary
-                      ? `${Math.round(replaySummary.passRate * 100)}% pass · ${Math.round(replaySummary.avgLatencyMs)}ms · d ${replaySummary.avgDirectness.toFixed(2)}`
-                      : "No replay run yet"}
-                  </p>
-                  {replayError ? (
-                    <p className="text-[10px] text-red-400 mt-1">{replayError}</p>
+                      <p className="eve-ticker text-[10px] text-[color:var(--eve-muted)]">
+                        Leading topic
+                      </p>
+                      <p
+                        className="eve-display text-[clamp(0.95rem,3.8vw,1.4rem)] truncate px-1 leading-tight"
+                        style={{
+                          color: streamHeroTrend.color,
+                          filter: reduceMotion ? undefined : "drop-shadow(0 0 14px currentColor)",
+                        }}
+                      >
+                        {streamHeroTrend.name}
+                      </p>
+                    </motion.div>
                   ) : null}
+                  <div className="flex-1 min-h-0 min-w-0 flex flex-col">
+                    <TrendRadarChart
+                      variant="stream"
+                      reduceMotion={reduceMotion}
+                      polar={trendPolarData}
+                      activeTrendName={activeTrendHighlight}
+                      speechPulse={speechPulse}
+                      voice={{
+                        audioAnalyzerRef,
+                        isPlayingTTS,
+                        progressNorm: radarVoiceBonding.progressNorm,
+                        dimOthersWhenSpeaking:
+                          isPlayingTTS && Boolean(activeTrendHighlight?.trim()),
+                      }}
+                      bondingHud={
+                        <>
+                          {!radarVoiceBonding.bondingHasData &&
+                          latestMcSol === null ? (
+                            <span className="block text-cyan-400/90 text-[10px] leading-tight">
+                              Connect a token
+                            </span>
+                          ) : null}
+                          {radarVoiceBonding.bondingHasData &&
+                          radarVoiceBonding.progress !== null &&
+                          radarVoiceBonding.progress < 100 &&
+                          bondingCurveData?.realTokenReserves != null ? (
+                            <span className="block font-mono text-fuchsia-200/90 text-[10px] leading-tight">
+                              Pending{" "}
+                              {(() => {
+                                const currentTokens = BigInt(
+                                  bondingCurveData.realTokenReserves,
+                                );
+                                const initialTokens = BigInt("793100000000000");
+                                return `${(Number((currentTokens * BigInt("10000")) / initialTokens) / 100).toFixed(1)}%`;
+                              })()}
+                            </span>
+                          ) : null}
+                        </>
+                      }
+                    />
+                  </div>
+                  <TrendHeatLeaderboard
+                    variant="stream"
+                    polar={trendPolarData}
+                    activeTrendName={activeTrendHighlight}
+                    dimUnfocusedDuringSpeech={
+                      isPlayingTTS && Boolean(activeTrendHighlight?.trim())
+                    }
+                    className="shrink-0"
+                  />
                 </div>
-              </div>
-            </div>
-          )}
-
-          <div className="flex-1 flex flex-col min-h-0 overflow-y-auto overflow-x-hidden relative z-10">
-            <div className="flex-1 min-h-0 flex flex-col px-2 sm:px-3 pt-1 pb-1 lg:pt-0">
-              <div className="flex-1 min-h-0 flex flex-col lg:flex-row lg:items-stretch gap-3 min-h-0">
-                <TrendHeatLeaderboard
-                  polar={trendPolarData}
-                  activeTrendName={activeTrendHighlight}
-                  className="max-h-[min(38vh,340px)] lg:max-h-none lg:h-full lg:min-h-0 lg:w-[min(100%,320px)] lg:shrink-0"
-                />
-                <div className="flex-1 min-h-0 min-w-0 flex flex-col min-h-[240px] lg:min-h-0">
+              ) : (
+              <div className="flex min-h-0 w-full flex-1 flex-col gap-2 lg:grid lg:min-h-0 lg:grid-cols-[min(320px,100%)_1fr] lg:grid-rows-[auto_1fr] lg:gap-x-3 lg:gap-y-0">
+                <div className="relative z-10 flex shrink-0 flex-wrap items-center gap-2 sm:gap-4 px-3 py-2.5 sm:min-h-[2.75rem] sm:px-6 lg:col-start-1 lg:row-start-1 lg:px-0">
+                  <div className="flex min-w-0 flex-shrink-0 flex-wrap items-center gap-2 sm:gap-4">
+                    <input
+                      type="text"
+                      placeholder="Token name"
+                      value={streamName}
+                      onChange={(e) => setStreamName(e.target.value)}
+                      className="w-32 bg-transparent border-b border-transparent font-bold text-white placeholder:text-gray-500 transition-colors hover:border-white/20 focus:border-cyan-500/60 focus:outline-none sm:w-44 text-lg sm:text-xl"
+                    />
+                    <span className="rounded bg-white/10 px-2 py-0.5 font-mono text-sm text-gray-300">
+                      $ <input
+                        type="text"
+                        placeholder="TICKER"
+                        value={streamSymbol}
+                        onChange={(e) =>
+                          setStreamSymbol(e.target.value.toUpperCase())
+                        }
+                        className="w-16 bg-transparent font-mono placeholder:text-gray-500 focus:outline-none sm:w-20"
+                      />
+                    </span>
+                  </div>
+                </div>
+                <div className="flex min-h-0 w-full flex-1 flex-col self-stretch lg:col-start-1 lg:row-start-2 lg:min-h-0 lg:w-[min(100%,320px)] lg:shrink-0">
+                  <TrendHeatLeaderboard
+                    polar={trendPolarData}
+                    activeTrendName={activeTrendHighlight}
+                    dimUnfocusedDuringSpeech={
+                      isPlayingTTS && Boolean(activeTrendHighlight?.trim())
+                    }
+                    className="min-h-0 flex-1"
+                  />
+                </div>
+                <div className="flex min-h-0 min-w-0 flex-1 flex-col lg:col-start-2 lg:row-span-2 lg:row-start-1 lg:min-h-0">
                   <TrendRadarChart
+                    reduceMotion={reduceMotion}
                     polar={trendPolarData}
                     activeTrendName={activeTrendHighlight}
                     speechPulse={speechPulse}
@@ -2673,6 +2798,8 @@ export default function PumpfunChatPage({
                       audioAnalyzerRef,
                       isPlayingTTS,
                       progressNorm: radarVoiceBonding.progressNorm,
+                      dimOthersWhenSpeaking:
+                        isPlayingTTS && Boolean(activeTrendHighlight?.trim()),
                     }}
                     bondingHud={
                       <>
@@ -2702,54 +2829,10 @@ export default function PumpfunChatPage({
                   />
                 </div>
               </div>
+              )}
               {trendsError && (
-                <p className="text-[10px] text-red-400/90 mt-1 px-1 shrink-0">{trendsError}</p>
-              )}
-              {trendsFetchedAt && !trendsError && (
-                <p className="text-[9px] text-zinc-600 mt-0.5 px-1 font-mono shrink-0">
-                  Updated{" "}
-                  {new Date(trendsFetchedAt).toLocaleTimeString("en-US", {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                    second: "2-digit",
-                    hour12: true,
-                  })}
-                </p>
-              )}
-            </div>
-
-            {winningTrend && (
-              <div className="mx-2 mb-2 px-3 py-2 rounded-lg bg-fuchsia-500/20 border border-fuchsia-500/40 text-fuchsia-100 text-xs font-semibold text-center">
-                Vote winner: {winningTrend}
-              </div>
-            )}
-
-            <div className="shrink-0 px-3 py-2 border-y border-white/5 space-y-1.5 bg-black/20">
-              <p className="text-[9px] font-mono text-zinc-500 uppercase tracking-wider">
-                Chat votes · !vote 1–{Math.min(20, liveTrendsDeduped.length) || "N"} · !pick name
-              </p>
-              <div className="flex flex-wrap gap-1.5">
-                {top3Votes.length === 0 ? (
-                  <span className="text-[10px] text-zinc-500">No votes yet</span>
-                ) : (
-                  top3Votes.map(([name, n]) => (
-                    <span
-                      key={name}
-                      className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 border border-cyan-500/25 truncate max-w-[160px]"
-                      title={name}
-                    >
-                      {name.length > 22 ? `${name.slice(0, 20)}…` : name} · {n}
-                    </span>
-                  ))
-                )}
-              </div>
-              {voteLeader && (
-                <p className="text-[11px] text-cyan-400/90">
-                  Leading:{" "}
-                  <span className="font-semibold text-white">{voteLeader}</span>{" "}
-                  <span className="text-zinc-500">
-                    (goal {voteGoal} to crown)
-                  </span>
+                <p className="mt-1 shrink-0 px-1 text-[10px] text-red-400/90">
+                  {trendsError}
                 </p>
               )}
             </div>
@@ -2761,6 +2844,7 @@ export default function PumpfunChatPage({
                   initial={false}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -8 }}
+                  transition={{ duration: reduceMotion ? 0 : 0.25 }}
                   className="flex justify-center px-4 py-2 shrink-0"
                 >
                   <div className="flex items-center justify-center gap-2 text-xs font-mono bg-fuchsia-900/30 text-fuchsia-200 border border-fuchsia-500/20 py-1.5 px-3 rounded-full w-max max-w-full">
@@ -2786,24 +2870,34 @@ export default function PumpfunChatPage({
           </div>
         </div>
 
-        {/* Chat panel - fixed width, full height, glass + gradient accent */}
-        <div className="w-full sm:w-[320px] lg:w-[380px] flex-shrink-0 flex flex-col bg-black/20 backdrop-blur-xl overflow-hidden relative">
-          <div className="absolute left-0 top-0 bottom-0 w-px bg-gradient-to-b from-cyan-500/30 via-fuchsia-500/20 to-cyan-500/20 pointer-events-none" aria-hidden />
-          <div className="p-3 sm:p-4 border-b border-white/5 flex items-center justify-between flex-shrink-0">
-            <h2 className="text-sm font-bold flex items-center gap-2 text-white">
-              <MessageSquare className="w-4 h-4 text-cyan-400" />
+        {/* Chat panel - fixed width, match main column height to footer padding */}
+        <div className="w-full sm:w-[320px] lg:w-[380px] flex-shrink-0 min-h-0 flex flex-col self-stretch eve-panel rounded-none border-y-0 border-r-0 overflow-hidden relative shadow-[0_0_40px_rgba(0,0,0,0.4)]">
+          <div
+            className="absolute left-0 top-0 bottom-0 w-px bg-gradient-to-b from-[color:var(--eve-accent-a)]/50 via-[color:var(--eve-accent-b)]/35 to-[color:var(--eve-accent-a)]/40 pointer-events-none"
+            aria-hidden
+          />
+          {connectionNotice ? (
+            <div
+              className="relative z-10 shrink-0 border-b border-amber-500/25 bg-amber-950/30 px-3 py-2 sm:px-4"
+              role="status"
+              aria-live="polite"
+            >
+              <p
+                className="text-center text-[10px] leading-snug text-amber-400/95 sm:text-xs"
+                title={connectionNotice}
+              >
+                {connectionNotice}
+              </p>
+            </div>
+          ) : null}
+          <div className="flex flex-shrink-0 items-center justify-between border-b border-[color:var(--eve-border)] p-3 sm:p-4">
+            <h2 className="eve-ticker text-sm flex items-center gap-2 text-[color:var(--eve-text)]">
+              <MessageSquare className="w-4 h-4 text-[color:var(--eve-accent-a)]" />
               Live Chat
             </h2>
-            <span className="text-[10px] font-mono text-cyan-300/80 bg-white/5 px-2 py-0.5 rounded-full">
+            <span className="text-[10px] font-mono text-[color:var(--eve-accent-b)] bg-[color-mix(in_srgb,var(--eve-accent-b)_12%,transparent)] px-2 py-0.5 rounded-full border border-[color:var(--eve-border)]">
               {messages.length}
             </span>
-          </div>
-          <div className="px-3 py-1.5 border-b border-white/5 bg-white/[0.02] shrink-0">
-            <p className="text-[9px] text-zinc-500 leading-snug">
-              Vote for launch themes:{" "}
-              <span className="text-cyan-400/90 font-mono">!vote 1</span> or{" "}
-              <span className="text-cyan-400/90 font-mono">!pick partial-name</span>
-            </p>
           </div>
           <div className="flex-1 overflow-y-auto p-3 space-y-2 min-h-0">
               {!isConnected && chatListMessages.length === 0 ? (
@@ -2826,12 +2920,15 @@ export default function PumpfunChatPage({
                     const isActive = msg.id === activeMessageId;
                     const isTooShort = msg.message.trim().length <= 3;
                     const replyText = aiReplies[msg.id];
+                    const hideCueBubble = isSyntheticChatAgentRow(msg);
                     
                     return (
                       <React.Fragment key={msg.id || i}>
+                        {!hideCueBubble && (
                         <motion.div
                           initial={false}
                           animate={{ opacity: 1, x: 0, scale: 1 }}
+                          transition={{ duration: reduceMotion ? 0 : 0.18 }}
                           className={`pb-1 px-3 rounded-lg flex items-start gap-2 transition-all group ${
                             isActive 
                               ? 'bg-cyan-900/40 border border-cyan-400 shadow-[0_0_15px_rgba(34,211,238,0.35)] z-10 scale-[1.02]' 
@@ -2884,6 +2981,7 @@ export default function PumpfunChatPage({
                           )
                         )} */}
                       </motion.div>
+                        )}
 
                       {replyText && (
                         <motion.div
