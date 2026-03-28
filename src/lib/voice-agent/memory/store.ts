@@ -5,7 +5,10 @@ import {
   fetchPersistentMemoryBundle,
   isPersistentMemoryEnabled,
   recordPersistentTurn,
+  updateRoomSummary,
+  updateUserSummary,
 } from "@/lib/voice-agent/memory/postgres";
+import { summarizeRoom, summarizeUser } from "@/lib/voice-agent/memory/summarizer";
 
 type RoomMemoryState = {
   roomSummary: string | null;
@@ -22,6 +25,10 @@ const roomMemory = new Map<string, RoomMemoryState>();
 const userMemory = new Map<string, UserMemoryState>();
 
 const MAX_TURNS = 80;
+const SUMMARIZE_EVERY_N_TURNS = 10;
+
+// Track turn counts per room for summarization trigger
+const roomTurnCount = new Map<string, number>();
 
 type TurnRecordMeta = {
   intent?: string;
@@ -120,6 +127,27 @@ export async function recordTurn(
       ].slice(0, 25);
     }
     userMemory.set(uKey, user);
+  }
+
+  // Async summarization every N turns — never blocks response
+  if (role === "assistant" && isPersistentMemoryEnabled()) {
+    const count = (roomTurnCount.get(rKey) ?? 0) + 1;
+    roomTurnCount.set(rKey, count);
+    if (count % SUMMARIZE_EVERY_N_TURNS === 0) {
+      const currentRoom = roomMemory.get(rKey);
+      const currentUser = userMemory.get(userKey(req));
+      void (async () => {
+        const roomId = roomKey(req);
+        const username = req.username?.trim().toLowerCase() || "anon";
+        const roomSum = await summarizeRoom(currentRoom?.turns ?? [], currentRoom?.roomSummary ?? null);
+        if (roomSum) await updateRoomSummary(roomId, roomSum);
+        const userTurns = (currentRoom?.turns ?? []).filter((t) => t.speaker !== "Eve");
+        if (userTurns.length >= 5) {
+          const userSum = await summarizeUser(username, userTurns, currentUser?.userSummary ?? null);
+          if (userSum) await updateUserSummary(roomId, username, userSum);
+        }
+      })();
+    }
   }
 }
 

@@ -148,6 +148,42 @@ export async function fetchPersistentMemoryBundle(req: TurnRequest): Promise<Mem
   }
 }
 
+export async function updateRoomSummary(roomId: string, summary: string): Promise<void> {
+  const pg = await getPgClient();
+  if (!pg) return;
+  try {
+    await pg.query(MEMORY_SQL.createTables);
+    await pg.query(
+      `insert into room_memory (room_id, summary, updated_at)
+       values ($1, $2, now())
+       on conflict (room_id) do update set summary = $2, updated_at = now()`,
+      [roomId, summary.slice(0, 2000)],
+    );
+  } catch {
+    // silent — memory is best-effort
+  } finally {
+    await pg.end?.().catch(() => {});
+  }
+}
+
+export async function updateUserSummary(roomId: string, username: string, summary: string): Promise<void> {
+  const pg = await getPgClient();
+  if (!pg) return;
+  try {
+    await pg.query(MEMORY_SQL.createTables);
+    await pg.query(
+      `insert into user_memory (room_id, user_name, summary, updated_at)
+       values ($1, $2, $3, now())
+       on conflict (room_id, user_name) do update set summary = $3, updated_at = now()`,
+      [roomId, username, summary.slice(0, 2000)],
+    );
+  } catch {
+    // silent — memory is best-effort
+  } finally {
+    await pg.end?.().catch(() => {});
+  }
+}
+
 export async function recordPersistentTurn(
   req: TurnRequest,
   role: "user" | "assistant",

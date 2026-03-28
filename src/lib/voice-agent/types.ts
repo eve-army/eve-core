@@ -51,6 +51,10 @@ export type TurnRequest = {
     currentMcSol?: number | null;
   };
   varietySeed?: number;
+  /** When set, server uses XTTS instead of ElevenLabs. Value is the XTTS speaker name. */
+  xttsVoice?: string;
+  /** Trends/topics Eve has already commented on this session — prevents re-opening same subjects unprompted. */
+  sessionTopicsSoFar?: string[];
 };
 
 export type MemoryFact = {

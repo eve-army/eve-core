@@ -552,7 +552,8 @@ export default function PumpfunChatPage({
   
   // Voice Models State
   const [customVoices, setCustomVoices] = useState<{name: string, id: string}[]>([]);
-  const [selectedVoice, setSelectedVoice] = useState<string>("elevenlabs_default");
+  const [xttsVoices, setXttsVoices] = useState<string[]>([]);
+  const [selectedVoice, setSelectedVoice] = useState<string>("");
   const [isLoadingVoices, setIsLoadingVoices] = useState<boolean>(true);
 
   const [showAddVoice, setShowAddVoice] = useState(false);
@@ -892,7 +893,7 @@ export default function PumpfunChatPage({
         if (isMounted && res.data && Array.isArray(res.data) && Array.isArray(res.data[0]?.choices)) {
           const choices = res.data[0].choices;
           const fetchedVoices = choices.map((choice: [string, string]) => ({ name: choice[0], id: choice[1] }));
-          
+
           setCustomVoices(prev => {
             const existingIds = new Set(prev.map(v => v.id));
             const newVoices = fetchedVoices.filter((v: any) => !existingIds.has(v.id));
@@ -906,8 +907,28 @@ export default function PumpfunChatPage({
         if (isMounted) setIsLoadingVoices(false);
       }
     };
-    
+
     fetchHFModels();
+    return () => { isMounted = false; };
+  }, []);
+
+  // Auto-fetch XTTS speakers on load
+  useEffect(() => {
+    let isMounted = true;
+    fetch("/api/xtts/speakers")
+      .then((r) => r.json())
+      .then((data: { speakers?: string[] }) => {
+        if (isMounted && Array.isArray(data.speakers) && data.speakers.length > 0) {
+          setXttsVoices(data.speakers);
+          setSelectedVoice((prev) => {
+            if (prev) return prev;
+            const preferred = data.speakers!.find((s) => s === "Ana Florence");
+            return `xtts_${preferred ?? data.speakers![0]}`;
+          });
+          console.log(`Auto-loaded ${data.speakers.length} XTTS speakers`);
+        }
+      })
+      .catch((e) => console.error("Failed to load XTTS speakers:", e));
     return () => { isMounted = false; };
   }, []);
 
@@ -1306,7 +1327,9 @@ export default function PumpfunChatPage({
         }
       }
 
-      const useHF = selectedVoice !== "elevenlabs_default";
+      const isXtts = selectedVoice.startsWith("xtts_");
+      const useHF = !isXtts && selectedVoice !== "" && !selectedVoice.startsWith("xtts_");
+      const skipTTS = !isXtts && !useHF;
 
       const ac = new AbortController();
       const fetchTimeoutId = window.setTimeout(
@@ -1336,11 +1359,13 @@ export default function PumpfunChatPage({
             streamName: stateRefs.current.streamName,
             isBondedToken: stateRefs.current.isBondedToken,
             solUsdPrice: stateRefs.current.solUsdPrice,
-            skipTTS: useHF,
+            skipTTS: skipTTS || useHF,
+            xttsVoice: isXtts ? selectedVoice.replace("xtts_", "") : undefined,
             agentMode,
             liveTrendsDeduped: stateRefs.current.liveTrendsDeduped,
             newTrendNamesFromRadar: stateRefs.current.newTrendNamesFromRadar,
             recentlyMentionedTrendNames: mentionedTrendsRef.current,
+            sessionTopicsSoFar: mentionedTrendsRef.current,
             activeTrendSpeaking: activeSpeak,
             recentChatTranscript: recentChatTranscript ?? undefined,
             lastAgentSay: lastAgentSay ?? undefined,
@@ -1458,7 +1483,7 @@ export default function PumpfunChatPage({
           audioUrl = hfResult;
           if (!audioUrl) {
             setError(
-              "Hugging Face voice timed out. Try Eve (ElevenLabs) or try again.",
+              "Hugging Face voice timed out. Try an XTTS voice or try again.",
             );
           }
         } catch (err) {
@@ -2525,7 +2550,9 @@ export default function PumpfunChatPage({
               onChange={(e) => setSelectedVoice(e.target.value)}
               className="bg-white/5 border border-white/10 rounded-lg py-1.5 px-2 text-sm text-cyan-100 focus:outline-none focus:ring-1 focus:ring-cyan-500/50 appearance-none cursor-pointer"
             >
-              <option value="elevenlabs_default" className="bg-gray-900">Eve (ElevenLabs)</option>
+              {xttsVoices.map(name => (
+                <option key={`xtts_${name}`} value={`xtts_${name}`} className="bg-gray-900">{name} (XTTS)</option>
+              ))}
               {customVoices.map(v => (
                 <option key={v.id} value={v.id} className="bg-gray-900">{v.name} (HF)</option>
               ))}
@@ -2540,19 +2567,37 @@ export default function PumpfunChatPage({
             </button>
             <button
               onClick={async () => {
-                 if (selectedVoice === "elevenlabs_default") {
-                   alert("Please select an HF voice model to test");
+                 if (!selectedVoice) {
+                   alert("Please select an HF or XTTS voice model to test");
                    return;
                  }
                  try {
-                   const audioUrl = await generateHuggingFaceTts(
-                     "Hello! This is a simple test of the Hugging Face text to speech request.",
-                     selectedVoice,
-                     "en-US-ChristopherNeural"
-                   );
-                   if (audioUrl) {
-                      const audio = new Audio(audioUrl);
-                      audio.play();
+                   if (selectedVoice.startsWith("xtts_")) {
+                     const speakerName = selectedVoice.replace("xtts_", "");
+                     const res = await fetch("/api/agent/turn", {
+                       method: "POST",
+                       headers: { "Content-Type": "application/json" },
+                       body: JSON.stringify({
+                         message: "Hello! This is a test of the XTTS voice.",
+                         skipTTS: false,
+                         xttsVoice: speakerName,
+                       }),
+                     });
+                     const data = await res.json();
+                     if (data.audio) {
+                       const audio = new Audio(data.audio);
+                       audio.play();
+                     }
+                   } else {
+                     const audioUrl = await generateHuggingFaceTts(
+                       "Hello! This is a simple test of the Hugging Face text to speech request.",
+                       selectedVoice,
+                       "en-US-ChristopherNeural"
+                     );
+                     if (audioUrl) {
+                       const audio = new Audio(audioUrl);
+                       audio.play();
+                     }
                    }
                  } catch (err) {
                     alert("Test TTS failed: " + err);
