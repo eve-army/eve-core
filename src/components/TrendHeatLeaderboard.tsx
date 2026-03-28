@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { motion, useReducedMotion } from "framer-motion";
 import {
   sentimentPalette,
@@ -120,43 +120,60 @@ export default function TrendHeatLeaderboard({
                     ? `${pt.trend_name.slice(0, 11)}…`
                     : pt.trend_name;
                 return (
-                  <motion.div
-                    key={pt.trend_name}
-                    title={trendHoverTitle(pt)}
-                    layout={!reduceMotion}
-                    transition={
-                      reduceMotion
-                        ? undefined
-                        : { type: "spring", stiffness: 420, damping: 34 }
-                    }
-                    className={`flex items-center gap-1.5 rounded-lg border px-2 py-1.5 min-w-0 max-w-[155px] shrink-0 transition-opacity duration-200 ${
-                      isActive
-                        ? "bg-[color-mix(in_srgb,var(--eve-accent-a)_18%,transparent)] border-[color:var(--eve-border-strong)] scale-[1.02]"
-                        : "bg-[color-mix(in_srgb,var(--eve-bg-mid)_70%,transparent)] border-[color:var(--eve-border)]"
-                    } ${dimmed ? "opacity-[0.28]" : ""}`}
-                    style={{ borderLeftWidth: 4, borderLeftColor: border }}
-                  >
-                    <span className="eve-display text-sm text-[color:var(--eve-muted)] w-4 text-center shrink-0 leading-none">
-                      {i + 1}
-                    </span>
-                    <span
-                      className="h-2.5 w-2.5 shrink-0 rounded-full"
-                      style={{
-                        backgroundColor: dot,
-                        boxShadow: `0 0 10px ${dot}99`,
-                      }}
-                      aria-hidden
-                    />
-                    <span className="eve-ticker text-[11px] text-[color:var(--eve-text)] truncate min-w-0 font-bold">
-                      {short}
-                    </span>
-                    <span
-                      className="text-[10px] font-mono text-[color:var(--eve-accent-a)] shrink-0 tabular-nums font-bold"
-                      style={{ fontFamily: "var(--font-eve-mono), monospace" }}
+                  <div key={pt.trend_name} className="relative group shrink-0">
+                    <motion.div
+                      title={pt.image_url ? undefined : trendHoverTitle(pt)}
+                      layout={!reduceMotion}
+                      transition={
+                        reduceMotion
+                          ? undefined
+                          : { type: "spring", stiffness: 420, damping: 34 }
+                      }
+                      className={`flex items-center gap-1.5 rounded-lg border px-2 py-1.5 min-w-0 max-w-[155px] shrink-0 transition-opacity duration-200 ${
+                        isActive
+                          ? "bg-[color-mix(in_srgb,var(--eve-accent-a)_18%,transparent)] border-[color:var(--eve-border-strong)] scale-[1.02]"
+                          : "bg-[color-mix(in_srgb,var(--eve-bg-mid)_70%,transparent)] border-[color:var(--eve-border)]"
+                      } ${dimmed ? "opacity-[0.28]" : ""}`}
+                      style={{ borderLeftWidth: 4, borderLeftColor: border }}
                     >
-                      {pt.maxHeat.toFixed(0)}
-                    </span>
-                  </motion.div>
+                      <span className="eve-display text-sm text-[color:var(--eve-muted)] w-4 text-center shrink-0 leading-none">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-full"
+                        style={{
+                          backgroundColor: dot,
+                          boxShadow: `0 0 10px ${dot}99`,
+                        }}
+                        aria-hidden
+                      />
+                      <span className="eve-ticker text-[11px] text-[color:var(--eve-text)] truncate min-w-0 font-bold">
+                        {short}
+                      </span>
+                      <span
+                        className="text-[10px] font-mono text-[color:var(--eve-accent-a)] shrink-0 tabular-nums font-bold"
+                        style={{ fontFamily: "var(--font-eve-mono), monospace" }}
+                      >
+                        {pt.maxHeat.toFixed(0)}
+                      </span>
+                    </motion.div>
+                    {pt.image_url && (
+                      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block z-50 pointer-events-none">
+                        <div className="rounded-lg overflow-hidden shadow-xl border border-white/10 bg-gray-900">
+                          <img
+                            src={pt.image_url}
+                            alt={pt.trend_name}
+                            className="max-w-[200px] max-h-[140px] object-cover"
+                            onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                          />
+                          <div className="px-2 py-1.5 text-[10px] text-zinc-300 leading-snug max-w-[200px]">
+                            <b>{pt.trend_name}</b>
+                            {pt.summary.trim() ? <p className="mt-0.5 text-zinc-400">{pt.summary.trim().slice(0, 120)}</p> : null}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 );
               })}
             </div>
@@ -209,9 +226,10 @@ export default function TrendHeatLeaderboard({
                 <li
                   key={pt.trend_name}
                   ref={isActive ? activeRowRef : undefined}
+                  className="relative group"
                 >
                   <div
-                    title={trendHoverTitle(pt)}
+                    title={pt.image_url ? undefined : trendHoverTitle(pt)}
                     className={`flex items-start gap-2 rounded-lg border border-l-[3px] transition-[opacity,colors] duration-200 box-border ${
                       isActive
                         ? "bg-[color-mix(in_srgb,var(--eve-accent-a)_14%,transparent)] border-[color:var(--eve-border-strong)]"
@@ -219,6 +237,23 @@ export default function TrendHeatLeaderboard({
                     } ${dimmed ? "opacity-[0.3]" : ""}`}
                     style={{ borderLeftColor: border }}
                   >
+                    {pt.image_url && (
+                      <div className="absolute left-full top-0 ml-2 hidden group-hover:block z-50 pointer-events-none">
+                        <div className="rounded-lg overflow-hidden shadow-xl border border-white/10 bg-gray-900">
+                          <img
+                            src={pt.image_url}
+                            alt={pt.trend_name}
+                            className="w-[200px] max-h-[140px] object-cover"
+                            onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                          />
+                          {pt.summary.trim() ? (
+                            <p className="px-2 py-1.5 text-[10px] text-zinc-400 leading-snug max-w-[200px]">
+                              {pt.summary.trim().slice(0, 120)}
+                            </p>
+                          ) : null}
+                        </div>
+                      </div>
+                    )}
                     <div className="flex min-w-0 flex-1 items-start gap-2.5 px-3 py-2 sm:px-3.5 sm:py-2">
                     <span
                       className="tabular-nums text-sm font-bold font-mono text-zinc-200 min-w-[1.75rem] text-right shrink-0 leading-none pt-0.5"

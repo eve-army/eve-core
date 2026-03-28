@@ -14,14 +14,21 @@ const TrendRowSchema = z.object({
   tweet_count: z.coerce.number().optional(),
   top_tweet_ids: z.array(z.string()).optional(),
   trend_direction: z.string().optional(),
+  image_url: z.string().nullable().optional(),
 });
 
 export type LiveTrendRow = z.infer<typeof TrendRowSchema>;
 
 export function parseLiveTrendsJson(json: unknown): LiveTrendRow[] {
-  if (!Array.isArray(json)) return [];
+  // Support both raw arrays and {trends: [...]} wrapper format.
+  const arr = Array.isArray(json)
+    ? json
+    : json != null && typeof json === "object" && Array.isArray((json as Record<string, unknown>).trends)
+      ? (json as Record<string, unknown>).trends as unknown[]
+      : null;
+  if (!arr) return [];
   const out: LiveTrendRow[] = [];
-  for (const item of json) {
+  for (const item of arr) {
     const r = TrendRowSchema.safeParse(item);
     if (r.success) out.push(r.data);
   }
@@ -39,6 +46,8 @@ export type DedupedTrend = {
   tweet_count?: number;
   /** From API when present; used to spread trends angularly by theme cluster. */
   cluster_id?: number;
+  /** Thumbnail image for the trend (from source). */
+  image_url?: string | null;
 };
 
 /** Normalize for comparing radar trend labels (case, whitespace). */
@@ -92,6 +101,7 @@ export function dedupeTrendsByName(rows: LiveTrendRow[]): DedupedTrend[] {
       typeof rawCluster === "number" && Number.isFinite(rawCluster)
         ? rawCluster
         : undefined;
+    const image_url = (hottest?.image_url || latest.image_url) ?? null;
     out.push({
       trend_name: name,
       summary: bestSummary || (latest.summary || "").slice(0, 280),
@@ -101,6 +111,7 @@ export function dedupeTrendsByName(rows: LiveTrendRow[]): DedupedTrend[] {
       updated_at: latest.updated_at || latest.cycle_start || new Date().toISOString(),
       tweet_count: tc || undefined,
       cluster_id,
+      image_url: image_url || undefined,
     });
   }
   return out.sort((a, b) => b.maxHeat - a.maxHeat);
@@ -171,6 +182,8 @@ export type TrendPolarPoint = {
   summary: string;
   angleDeg: number;
   change: TrendChangeKind;
+  /** Thumbnail image for the trend (from source). */
+  image_url?: string | null;
 };
 
 export type TrendPolarBuild = {
@@ -278,6 +291,7 @@ export function buildTrendPolarScatterData(
       summary: (d.summary || "").trim().slice(0, 400),
       angleDeg,
       change,
+      image_url: d.image_url,
     };
   });
   return {

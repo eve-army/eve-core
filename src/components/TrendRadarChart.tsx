@@ -344,7 +344,10 @@ export default function TrendRadarChart({
           const summaryBlock = sum
             ? `<br/><span style="opacity:.92;font-size:11px;line-height:1.35">${escapeHtmlTooltip(sum)}</span>`
             : "";
-          return `${motionBlock}<span style="color:${dotColor}">●</span> <b>${escapeHtmlTooltip(pt.trend_name)}</b><br/>heat ${pt.maxHeat.toFixed(1)}<br/>${escapeHtmlTooltip(pt.sentiment)}${summaryBlock}`;
+          const imgBlock = pt.image_url
+            ? `<br/><img src="${escapeHtmlTooltip(pt.image_url)}" style="max-width:160px;max-height:100px;border-radius:6px;margin-top:6px;object-fit:cover;" onerror="this.style.display='none'" />`
+            : "";
+          return `${motionBlock}<span style="color:${dotColor}">●</span> <b>${escapeHtmlTooltip(pt.trend_name)}</b><br/>heat ${pt.maxHeat.toFixed(1)}<br/>${escapeHtmlTooltip(pt.sentiment)}${summaryBlock}${imgBlock}`;
         },
       },
       polar: {
