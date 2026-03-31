@@ -170,7 +170,7 @@ User message:
 "${message}"
 
 Output strict JSON only — no markdown, no extra keys:
-{"say":"...", "highlightTrend":null}
+{"say":"...", "highlightTrend":null, "memecoins":[]}
 Rules:
 - say: 2-4 short spoken sentences max unless the user asked for detail. Write how you'd actually speak — contractions, rhythm, no stiff phrasing.
 - If you name a trend, set highlightTrend to that exact string from LIVE MINDSHARE TRENDS; else null.
@@ -179,6 +179,7 @@ Rules:
 - Tie trend mentions to the brief's concrete detail; close with something memecoin-specific — not generic "what does the community think" prompts.
 - If direct_reply: first sentence answers the user directly. Then, if trends are live and not recently mentioned, weave one in.
 - If trend_commentary or host_fill: end with a specific memecoin question — coinability, a name idea, or which trend to launch. Not vague hype.
+- memecoins: 0-3 objects when you invent memecoin names. Each: {"name":"...","ticker":"...","trend":"...","tagline":"..."}. Names can have spaces. No "Token" or "Coin" in names. Ticker is 3-6 uppercase letters, no spaces. trend must be copied exactly from LIVE MINDSHARE TRENDS — character for character. tagline must directly reference the trend content. Every name and ticker must be unique. Empty array [] if no ideas this turn.
 `;
 }
 

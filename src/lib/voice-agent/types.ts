@@ -115,6 +115,13 @@ export type CharacterAlignment = {
   character_end_times_seconds: number[];
 };
 
+export type TurnResponseMemecoin = {
+  name: string;
+  ticker: string;
+  sourceTrend: string;
+  tagline: string;
+};
+
 export type TurnResponse = {
   text: string;
   audio?: string;
@@ -126,4 +133,5 @@ export type TurnResponse = {
   quality: QualityScores;
   promptVersion: string;
   latencyMs: number;
+  memecoins: TurnResponseMemecoin[];
 };

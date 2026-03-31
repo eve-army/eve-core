@@ -8,30 +8,9 @@ import { incCounter } from "@/lib/voice-agent/observability/metrics";
 import type { CharacterAlignment, TurnRequest, TurnResponse, VoiceTimelineEvent } from "@/lib/voice-agent/types";
 import { normalizeTrendKey } from "@/lib/live-trends";
 
+import { qwenChat } from "@/lib/qwen-client";
+
 const DEFAULT_VOICE_ID = "PB6BdkFkZLbI39GHdnbQ";
-const QWEN_MODEL = () => process.env.QWEN_MODEL || "qwen2.5:3b";
-
-type QwenMessage = { role: string; content: string };
-
-async function qwenChat(messages: QwenMessage[]): Promise<string> {
-  const baseUrl = process.env.QWEN_BASE_URL || "https://server.songjam.space";
-  const res = await fetch(`${baseUrl}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: QWEN_MODEL(),
-      messages,
-      stream: false,
-      format: "json",
-    }),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Qwen API returned ${res.status}: ${err}`);
-  }
-  const data = (await res.json()) as { message?: { content?: string } };
-  return data.message?.content?.trim() || "";
-}
 
 function resolveHighlight(candidate: string | null, allowed: string[]): string | null {
   if (!candidate) return null;
@@ -75,7 +54,7 @@ export async function runTurn(req: TurnRequest): Promise<TurnResponse> {
     throw new Error("ELEVENLABS_API_KEY missing on server.");
   }
 
-  const messages: QwenMessage[] = [{ role: "system", content: prompt }];
+  const messages: { role: string; content: string }[] = [{ role: "system", content: prompt }];
   if (req.lastAgentSay?.trim()) {
     messages.push({
       role: "assistant",
@@ -203,6 +182,16 @@ export async function runTurn(req: TurnRequest): Promise<TurnResponse> {
   });
   incCounter("turn_success_total");
 
+  // Validate memecoins: resolve trend names against allowed list
+  const validatedMemecoins = (parsed.memecoins ?? [])
+    .map((mc) => ({
+      name: mc.name,
+      ticker: mc.ticker,
+      sourceTrend: resolveHighlight(mc.trend, allowed) ?? mc.trend,
+      tagline: mc.tagline,
+    }))
+    .filter((mc) => mc.name && mc.ticker);
+
   return {
     text: say,
     audio,
@@ -214,5 +203,6 @@ export async function runTurn(req: TurnRequest): Promise<TurnResponse> {
     quality,
     promptVersion: PROMPT_VERSION,
     latencyMs: Date.now() - started,
+    memecoins: validatedMemecoins,
   };
 }

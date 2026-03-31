@@ -45,8 +45,28 @@ import {
 import type { VoiceTimelineEvent } from "@/lib/voice-agent/types";
 import { isPumpSpamScamMessage } from "@/lib/pump-chat-filters";
 import { buildRecentChatTranscript } from "@/lib/agent-chat-context";
-import TrendHeatLeaderboard from "@/components/TrendHeatLeaderboard";
 import { streamTrendColor } from "@/lib/trend-stream-palette";
+import { type MemecoinIdea, computeViabilityScore, addMemecoins, tickMemecoins } from "@/lib/memecoin-ideas";
+import {
+  type LaunchState,
+  INITIAL_LAUNCH_STATE,
+  LAUNCH_CYCLE_MS,
+  LAUNCH_RETRY_MS,
+  MIN_IDEAS_BEFORE_LAUNCH,
+  SELECTION_DISPLAY_MS,
+  COUNTDOWN_SEC,
+  POST_LAUNCH_DISPLAY_MS,
+  selectBestMemecoin,
+} from "@/lib/memecoin-launch";
+import {
+  narrationSelecting,
+  narrationCountdownStart,
+  narrationCountdown5,
+  narrationCountdown3,
+  narrationLaunching,
+  narrationSuccess,
+  narrationFailed,
+} from "@/lib/memecoin-launch-narration";
 import { decideProactiveTurn } from "@/lib/voice-agent/proactive/scheduler";
 
 /** Plan Option B: auto-enable stream UI when viewport fits pump-style embed (no env required). */
@@ -64,11 +84,20 @@ function getStreamEmbedViewportSnapshot(): boolean {
   return window.matchMedia(STREAM_EMBED_MQ).matches;
 }
 
-const TrendRadarChart = dynamic(() => import("@/components/TrendRadarChart"), {
+const NeuralNetCanvas = dynamic(() => import("@/components/NeuralNetCanvas"), {
   ssr: false,
   loading: () => (
     <div className="w-full min-h-[220px] rounded-xl border border-[color:var(--eve-border)] bg-[var(--eve-surface)] animate-pulse" />
   ),
+});
+const MemecoinTicker = dynamic(() => import("@/components/MemecoinTicker"), {
+  ssr: false,
+});
+const LaunchResultOverlay = dynamic(() => import("@/components/LaunchResultOverlay"), {
+  ssr: false,
+});
+const BackgroundFlowField = dynamic(() => import("@/components/BackgroundFlowField"), {
+  ssr: false,
 });
 
 /** Min 5s; default poll 15s when env unset (was 45s). Align with `NEXT_PUBLIC_LIVE_TRENDS_POLL_MS`. */
@@ -561,6 +590,15 @@ export default function PumpfunChatPage({
   const [newVoiceUrl, setNewVoiceUrl] = useState("");
   const [isAddingVoice, setIsAddingVoice] = useState(false);
 
+  // Memecoin Maker state
+  const [memecoinIdeas, setMemecoinIdeas] = useState<MemecoinIdea[]>([]);
+  const [isAgentProcessing, setIsAgentProcessing] = useState(false);
+  const [launchState, setLaunchState] = useState<LaunchState>(INITIAL_LAUNCH_STATE);
+  const launchStateRef = useRef(launchState);
+  useEffect(() => { launchStateRef.current = launchState; }, [launchState]);
+  const totalIdeasGeneratedRef = useRef(0);
+  const launchAttemptedRef = useRef(false);
+
   const [liveTrendRows, setLiveTrendRows] = useState<LiveTrendRow[]>([]);
   const [trendsError, setTrendsError] = useState<string | null>(null);
   const [speechPulse, setSpeechPulse] = useState(0);
@@ -931,6 +969,304 @@ export default function PumpfunChatPage({
       .catch((e) => console.error("Failed to load XTTS speakers:", e));
     return () => { isMounted = false; };
   }, []);
+
+  // Memecoin idea cleanup — fade old items every 30s
+  useEffect(() => {
+    const iv = setInterval(() => {
+      setMemecoinIdeas((prev) => tickMemecoins(prev));
+    }, 30_000);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Memecoin generation loop — call dedicated endpoint every 45s with top trends
+  const isGeneratingRef = useRef(false);
+  useEffect(() => {
+    let isMounted = true;
+    const generate = async () => {
+      // Skip if a generation request is already in flight or launch is in progress
+      if (isGeneratingRef.current) return;
+      if (launchStateRef.current.phase !== "idle") return;
+      const deduped = dedupedRef.current;
+      if (!deduped || deduped.length === 0) return;
+      isGeneratingRef.current = true;
+      try {
+        setIsAgentProcessing(true);
+        const res = await fetch("/api/memecoin-ideas", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            trends: deduped
+              .slice(0, 8)
+              .map((t) => ({
+                trend_name: t.trend_name,
+                summary: t.summary,
+                heat_score: t.heat_score,
+                sentiment: t.sentiment,
+                tweet_count: t.tweet_count,
+                maxHeat: t.maxHeat,
+              })),
+          }),
+        });
+        if (!isMounted) return;
+        setIsAgentProcessing(false);
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          memecoins?: Array<{ name: string; ticker: string; trend?: string; tagline?: string; imageDescription?: string; mood?: string; generatedImageUrl?: string }>;
+        };
+        if (!isMounted || !Array.isArray(data.memecoins) || data.memecoins.length === 0) return;
+        console.log("[memecoin-ideas] raw API response memecoins:", data.memecoins.map(mc => ({
+          name: mc.name, ticker: mc.ticker,
+          hasGeneratedImageUrl: !!mc.generatedImageUrl,
+          imageUrlPrefix: mc.generatedImageUrl?.slice(0, 60),
+        })));
+        const newIdeas: MemecoinIdea[] = data.memecoins
+          .filter((mc) => mc.name && mc.ticker && !/coin|token/i.test(mc.name))
+          .map((mc, idx) => {
+            // Try exact match first, then fuzzy keyword match
+            let srcTrend = mc.trend ? deduped.find((t) => t.image_url && trendDisplayNamesMatch(t.trend_name, mc.trend!)) : undefined;
+            if (!srcTrend) {
+              const haystack = `${mc.trend || ""} ${mc.name} ${mc.tagline || ""}`.toLowerCase();
+              srcTrend = deduped
+                .filter((t) => t.image_url)
+                .find((t) => {
+                  const words = t.trend_name.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
+                  return words.some((w) => haystack.includes(w));
+                });
+            }
+            return {
+              id: `mc-${Date.now()}-${idx}`,
+              name: mc.name,
+              ticker: mc.ticker,
+              sourceTrends: srcTrend ? [srcTrend.trend_name] : (mc.trend ? [mc.trend] : []),
+              tagline: mc.tagline || "",
+              viabilityScore: computeViabilityScore(srcTrend ? [srcTrend] : []),
+              createdAt: Date.now(),
+              status: "ready" as const,
+              imageUrl: mc.generatedImageUrl || srcTrend?.image_url || null,
+            };
+          })
+          .filter((mc) => mc.imageUrl); // Every coin must have an image
+        console.log("[memecoin-ideas] after image filter:", newIdeas.length, "ideas with images:",
+          newIdeas.map(mc => ({ name: mc.name, imageUrlPrefix: mc.imageUrl?.slice(0, 60) })));
+        if (newIdeas.length > 0) {
+          setMemecoinIdeas((prev) => addMemecoins(prev, newIdeas));
+          totalIdeasGeneratedRef.current += newIdeas.length;
+          console.log(`[launch] total ideas generated: ${totalIdeasGeneratedRef.current} (need ${MIN_IDEAS_BEFORE_LAUNCH})`);
+          // Announce new memecoins via XTTS + show in chat
+          const names = newIdeas.map((mc) => `${mc.name}, ticker ${mc.ticker}`).join(". ");
+          const announcement = newIdeas.length === 1
+            ? `New memecoin idea: ${names}. ${newIdeas[0].tagline || ""}`
+            : `${newIdeas.length} new memecoin ideas: ${names}.`;
+
+          // Add to chat as a persistent Eve message
+          const announceMsgId = `mc-announce-${Date.now()}`;
+          const announceMsg = syntheticAgentMessage({
+            id: announceMsgId,
+            message: announcement,
+            username: "Eve",
+          });
+          setMessages((prev) => [...prev, announceMsg]);
+
+          // Speak via XTTS using AudioContext (survives autoplay policy if user has interacted)
+          void (async () => {
+            try {
+              const ttsRes = await fetch("/api/xtts/tts", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text: announcement.replace(/memecoin/gi, "meemcoin") }),
+              });
+              if (!ttsRes.ok) return;
+              const ttsData = (await ttsRes.json()) as { audio_base64?: string };
+              if (!ttsData.audio_base64) return;
+              // Try AudioContext first (primed on user interaction), fall back to HTML Audio
+              const ctx = audioContextRef.current;
+              if (ctx && ctx.state === "running") {
+                const raw = atob(ttsData.audio_base64);
+                const buf = new Uint8Array(raw.length);
+                for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+                const audioBuffer = await ctx.decodeAudioData(buf.buffer);
+                const source = ctx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(ctx.destination);
+                source.start();
+              } else {
+                const audio = new Audio(`data:audio/wav;base64,${ttsData.audio_base64}`);
+                await audio.play();
+              }
+            } catch { /* silent — TTS is best-effort */ }
+          })();
+        }
+      } catch {
+        if (isMounted) setIsAgentProcessing(false);
+      } finally {
+        isGeneratingRef.current = false;
+      }
+    };
+    // First generation after 2 seconds (trends load in <1s)
+    const initial = setTimeout(generate, 2_000);
+    const iv = setInterval(generate, 45_000);
+    return () => {
+      isMounted = false;
+      clearTimeout(initial);
+      clearInterval(iv);
+    };
+  }, []);
+
+  // ── TTS helper (reusable) ──────────────────────────────────
+  const speakViaTTS = useCallback(async (text: string) => {
+    try {
+      const ttsRes = await fetch("/api/xtts/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!ttsRes.ok) return;
+      const ttsData = (await ttsRes.json()) as { audio_base64?: string };
+      if (!ttsData.audio_base64) return;
+      const ctx = audioContextRef.current;
+      if (ctx && ctx.state === "running") {
+        const raw = atob(ttsData.audio_base64);
+        const buf = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+        const audioBuffer = await ctx.decodeAudioData(buf.buffer);
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(ctx.destination);
+        source.start();
+      } else {
+        const audio = new Audio(`data:audio/wav;base64,${ttsData.audio_base64}`);
+        await audio.play();
+      }
+    } catch { /* TTS is best-effort */ }
+  }, []);
+
+  // ── Launch Sequence ───────────────────────────────────────
+  const executeLaunchSequence = useCallback(async () => {
+    if (launchAttemptedRef.current) return;
+    launchAttemptedRef.current = true;
+
+    const deduped = dedupedRef.current ?? [];
+    const selected = selectBestMemecoin(memecoinIdeas, deduped);
+    if (!selected) {
+      launchAttemptedRef.current = false;
+      return;
+    }
+
+    const vars = {
+      name: selected.name,
+      ticker: selected.ticker,
+      tagline: selected.tagline,
+      trend: selected.sourceTrends[0] || "",
+      score: String(selected.viabilityScore),
+      mint: "",
+      error: "",
+    };
+
+    // Mark as selected (protected from fading)
+    setMemecoinIdeas((prev) =>
+      prev.map((m) => (m.id === selected.id ? { ...m, status: "selected" as const } : m)),
+    );
+
+    // Phase 1: SELECTING
+    setLaunchState({ phase: "selecting", selectedIdea: selected, countdownSec: 0, phaseStartedAt: Date.now(), deployResult: null, error: null });
+    const selectText = narrationSelecting(vars);
+    setMessages((prev) => [...prev, syntheticAgentMessage({ id: `launch-select-${Date.now()}`, message: selectText, username: "Eve" })]);
+    void speakViaTTS(selectText);
+    await new Promise((r) => setTimeout(r, SELECTION_DISPLAY_MS));
+
+    // Phase 2: COUNTDOWN
+    const countdownText = narrationCountdownStart(vars);
+    setMessages((prev) => [...prev, syntheticAgentMessage({ id: `launch-countdown-${Date.now()}`, message: countdownText, username: "Eve" })]);
+    void speakViaTTS(countdownText);
+
+    for (let sec = COUNTDOWN_SEC; sec >= 0; sec--) {
+      setLaunchState((prev) => ({ ...prev, phase: "countdown", countdownSec: sec }));
+      if (sec === 5) void speakViaTTS(narrationCountdown5());
+      if (sec === 3) void speakViaTTS(narrationCountdown3());
+      if (sec > 0) await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    // Phase 3: DEPLOYING
+    setLaunchState((prev) => ({ ...prev, phase: "deploying" }));
+    const launchText = narrationLaunching(vars);
+    setMessages((prev) => [...prev, syntheticAgentMessage({ id: `launch-deploy-${Date.now()}`, message: launchText, username: "Eve" })]);
+    void speakViaTTS(launchText);
+
+    try {
+      const res = await fetch("/api/launch-memecoin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: selected.name,
+          ticker: selected.ticker,
+          description: selected.tagline || `Inspired by ${selected.sourceTrends[0] || "trending topics"}`,
+          imageUrl: selected.imageUrl,
+        }),
+      });
+      const data = (await res.json()) as { ok?: boolean; mint?: string; signature?: string; error?: string };
+
+      if (data.ok && data.mint) {
+        // Phase 4a: SUCCESS
+        vars.mint = data.mint;
+        setLaunchState((prev) => ({
+          ...prev,
+          phase: "success",
+          deployResult: { mint: data.mint!, signature: data.signature || "" },
+        }));
+        const successText = narrationSuccess(vars);
+        setMessages((prev) => [...prev, syntheticAgentMessage({
+          id: `launch-success-${Date.now()}`,
+          message: `${successText} https://pump.fun/coin/${data.mint}`,
+          username: "Eve",
+        })]);
+        void speakViaTTS(successText);
+
+        // Reset after display period
+        await new Promise((r) => setTimeout(r, POST_LAUNCH_DISPLAY_MS));
+        setLaunchState(INITIAL_LAUNCH_STATE);
+      } else {
+        throw new Error(data.error || "Deploy failed");
+      }
+    } catch (e) {
+      // Phase 4b: FAILED
+      const errMsg = e instanceof Error ? e.message : "Unknown error";
+      setLaunchState((prev) => ({ ...prev, phase: "failed", error: errMsg }));
+      const failText = narrationFailed({ ...vars, error: errMsg });
+      setMessages((prev) => [...prev, syntheticAgentMessage({ id: `launch-fail-${Date.now()}`, message: failText, username: "Eve" })]);
+      void speakViaTTS(failText);
+
+      await new Promise((r) => setTimeout(r, 10_000));
+      setLaunchState(INITIAL_LAUNCH_STATE);
+      launchAttemptedRef.current = false; // allow retry
+    }
+  }, [memecoinIdeas, speakViaTTS]);
+
+  // Launch cycle timer
+  useEffect(() => {
+    const launchEnabled = typeof process !== "undefined"
+      ? process.env.NEXT_PUBLIC_EVE_LAUNCH_ENABLED !== "0"
+      : true;
+    if (!launchEnabled) return;
+
+    const tryLaunch = () => {
+      if (launchAttemptedRef.current) return;
+      if (totalIdeasGeneratedRef.current >= MIN_IDEAS_BEFORE_LAUNCH) {
+        void executeLaunchSequence();
+      }
+    };
+
+    const timer = setTimeout(tryLaunch, LAUNCH_CYCLE_MS);
+    const retryTimer = setInterval(() => {
+      if (!launchAttemptedRef.current && totalIdeasGeneratedRef.current >= MIN_IDEAS_BEFORE_LAUNCH) {
+        void executeLaunchSequence();
+      }
+    }, LAUNCH_RETRY_MS);
+
+    return () => {
+      clearTimeout(timer);
+      clearInterval(retryTimer);
+    };
+  }, [executeLaunchSequence]);
 
   // Assume generic parsed room ID for DB
   const currentTokenAddress = React.useMemo(() => {
@@ -1331,6 +1667,7 @@ export default function PumpfunChatPage({
       const useHF = !isXtts && selectedVoice !== "" && !selectedVoice.startsWith("xtts_");
       const skipTTS = !isXtts && !useHF;
 
+      setIsAgentProcessing(true);
       const ac = new AbortController();
       const fetchTimeoutId = window.setTimeout(
         () => ac.abort(),
@@ -1384,6 +1721,7 @@ export default function PumpfunChatPage({
         highlightTrendName?: string | null;
         highlightTimeline?: unknown;
         events?: VoiceTimelineEvent[];
+        memecoins?: Array<{ name: string; ticker: string; sourceTrend?: string; tagline?: string }>;
       };
       try {
         data = await res.json();
@@ -1416,6 +1754,39 @@ export default function PumpfunChatPage({
           merged.push(name);
         }
         mentionedTrendsRef.current = merged.slice(0, 20);
+      }
+
+      // Extract memecoin ideas from agent response
+      setIsAgentProcessing(false);
+      if (Array.isArray(data.memecoins) && data.memecoins.length > 0) {
+        const newIdeas: MemecoinIdea[] = data.memecoins
+          .filter((mc: { name?: string; ticker?: string }) => mc.name && mc.ticker)
+          .map((mc: { name: string; ticker: string; sourceTrend?: string; tagline?: string; imageDescription?: string }, idx: number) => {
+            const srcTrend = (stateRefs.current.liveTrendsDeduped ?? []).find(
+              (t) => trendDisplayNamesMatch(t.trend_name, mc.sourceTrend || ""),
+            );
+            // Image via local proxy — use LLM-generated imageDescription when available
+            const _imgPrompt = mc.imageDescription
+              ? `${mc.imageDescription}, no text, no words, no letters, no watermark`
+              : `${mc.name}, ${mc.tagline || ""}, vibrant digital art, dark background, no text`;
+            const generatedImageUrl = `/api/memecoin-image?prompt=${encodeURIComponent(_imgPrompt)}`;
+            return {
+              id: `mc-${Date.now()}-${idx}`,
+              name: mc.name,
+              ticker: mc.ticker,
+              sourceTrends: mc.sourceTrend ? [mc.sourceTrend] : [],
+              tagline: mc.tagline || "",
+              viabilityScore: computeViabilityScore(srcTrend ? [srcTrend] : []),
+              createdAt: Date.now(),
+              imageUrl: generatedImageUrl || srcTrend?.image_url || null,
+              status: "ready" as const,
+            };
+          })
+          .filter((mc) => mc.imageUrl); // Every coin must have an image
+        if (newIdeas.length > 0) {
+          setMemecoinIdeas((prev) => addMemecoins(prev, newIdeas));
+          totalIdeasGeneratedRef.current += newIdeas.length;
+        }
       }
 
       const apiHighlight =
@@ -1499,6 +1870,7 @@ export default function PumpfunChatPage({
         ttsHighlightScheduleRef.current = null;
         lastSyncedHighlightRef.current = null;
         setIsPlayingTTS(false);
+        setIsAgentProcessing(false);
         setActiveMessageId(null);
         setHfStatus(null);
         setAgentEphemeralRow(null);
@@ -2414,6 +2786,8 @@ export default function PumpfunChatPage({
 
   return (
     <div className="h-dvh flex flex-col font-sans overflow-hidden text-[color:var(--eve-text)] selection:bg-[color-mix(in_srgb,var(--eve-accent-a)_35%,transparent)]">
+      {/* Animated particle flow field background */}
+      <BackgroundFlowField launchPhase={launchState.phase} speechPulse={speechPulse} />
       {/* Full-bleed broadcast background */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none z-0">
         <div className="absolute inset-0 bg-[var(--eve-bg-deep)]" />
@@ -2465,7 +2839,7 @@ export default function PumpfunChatPage({
               </span>
               {!isStreamLayout ? (
                 <span className="text-[color:var(--eve-accent-a)] font-bold normal-case tracking-normal text-[clamp(0.85rem,2vw,1.15rem)] font-[family-name:var(--font-eve-sans)]">
-                  Trend Analyst
+                  Meme Maker
                 </span>
               ) : (
                 <span className="eve-live-pulse text-[color:var(--eve-live)] font-bold normal-case tracking-wide text-sm sm:text-base font-[family-name:var(--font-eve-sans)]">
@@ -2719,162 +3093,37 @@ export default function PumpfunChatPage({
             <div
               className={`flex-1 min-h-0 flex flex-col px-1 sm:px-3 pb-1 pt-0 ${isStreamLayout ? "min-h-0" : ""}`}
             >
-              {isStreamLayout ? (
-                <div className="flex flex-col flex-1 min-h-0 gap-1.5">
-                  {streamHeroTrend ? (
-                    <motion.div
-                      key={streamHeroTrend.name}
-                      layout={!reduceMotion}
-                      initial={false}
-                      animate={{ opacity: 1, y: 0 }}
-                      transition={
-                        reduceMotion
-                          ? { duration: 0 }
-                          : { type: "spring", stiffness: 380, damping: 28 }
-                      }
-                      className="shrink-0 px-2 py-0.5 text-center border-b border-[color:var(--eve-border)]/80"
-                    >
-                      <p className="eve-ticker text-[10px] text-[color:var(--eve-muted)]">
-                        Leading topic
-                      </p>
-                      <p
-                        className="eve-display text-[clamp(0.95rem,3.8vw,1.4rem)] truncate px-1 leading-tight"
-                        style={{
-                          color: streamHeroTrend.color,
-                          filter: reduceMotion ? undefined : "drop-shadow(0 0 14px currentColor)",
-                        }}
-                      >
-                        {streamHeroTrend.name}
-                      </p>
-                    </motion.div>
-                  ) : null}
-                  <div className="flex-1 min-h-0 min-w-0 flex flex-col">
-                    <TrendRadarChart
-                      variant="stream"
-                      reduceMotion={reduceMotion}
-                      polar={trendPolarData}
-                      activeTrendName={activeTrendHighlight}
-                      speechPulse={speechPulse}
-                      voice={{
-                        audioAnalyzerRef,
-                        isPlayingTTS,
-                        progressNorm: radarVoiceBonding.progressNorm,
-                        dimOthersWhenSpeaking:
-                          isPlayingTTS && Boolean(activeTrendHighlight?.trim()),
-                      }}
-                      bondingHud={
-                        <>
-                          {!radarVoiceBonding.bondingHasData &&
-                          latestMcSol === null ? (
-                            <span className="block text-cyan-400/90 text-[10px] leading-tight">
-                              Connect a token
-                            </span>
-                          ) : null}
-                          {radarVoiceBonding.bondingHasData &&
-                          radarVoiceBonding.progress !== null &&
-                          radarVoiceBonding.progress < 100 &&
-                          bondingCurveData?.realTokenReserves != null ? (
-                            <span className="block font-mono text-fuchsia-200/90 text-[10px] leading-tight">
-                              Pending{" "}
-                              {(() => {
-                                const currentTokens = BigInt(
-                                  bondingCurveData.realTokenReserves,
-                                );
-                                const initialTokens = BigInt("793100000000000");
-                                return `${(Number((currentTokens * BigInt("10000")) / initialTokens) / 100).toFixed(1)}%`;
-                              })()}
-                            </span>
-                          ) : null}
-                        </>
-                      }
-                    />
-                  </div>
-                  <TrendHeatLeaderboard
-                    variant="stream"
-                    polar={trendPolarData}
-                    activeTrendName={activeTrendHighlight}
-                    dimUnfocusedDuringSpeech={
-                      isPlayingTTS && Boolean(activeTrendHighlight?.trim())
-                    }
-                    className="shrink-0"
-                  />
-                </div>
-              ) : (
-              <div className="flex min-h-0 w-full flex-1 flex-col gap-2 lg:grid lg:min-h-0 lg:grid-cols-[min(320px,100%)_1fr] lg:grid-rows-[auto_1fr] lg:gap-x-3 lg:gap-y-0">
-                <div className="relative z-10 flex shrink-0 flex-wrap items-center gap-2 sm:gap-4 px-3 py-2.5 sm:min-h-[2.75rem] sm:px-6 lg:col-start-1 lg:row-start-1 lg:px-0">
-                  <div className="flex min-w-0 flex-shrink-0 flex-wrap items-center gap-2 sm:gap-4">
-                    <input
-                      type="text"
-                      placeholder="Token name"
-                      value={streamName}
-                      onChange={(e) => setStreamName(e.target.value)}
-                      className="w-32 bg-transparent border-b border-transparent font-bold text-white placeholder:text-gray-500 transition-colors hover:border-white/20 focus:border-cyan-500/60 focus:outline-none sm:w-44 text-lg sm:text-xl"
-                    />
-                    <span className="rounded bg-white/10 px-2 py-0.5 font-mono text-sm text-gray-300">
-                      $ <input
-                        type="text"
-                        placeholder="TICKER"
-                        value={streamSymbol}
-                        onChange={(e) =>
-                          setStreamSymbol(e.target.value.toUpperCase())
-                        }
-                        className="w-16 bg-transparent font-mono placeholder:text-gray-500 focus:outline-none sm:w-20"
-                      />
-                    </span>
-                  </div>
-                </div>
-                <div className="flex min-h-0 w-full flex-1 flex-col self-stretch lg:col-start-1 lg:row-start-2 lg:min-h-0 lg:w-[min(100%,320px)] lg:shrink-0">
-                  <TrendHeatLeaderboard
-                    polar={trendPolarData}
-                    activeTrendName={activeTrendHighlight}
-                    dimUnfocusedDuringSpeech={
-                      isPlayingTTS && Boolean(activeTrendHighlight?.trim())
-                    }
-                    className="min-h-0 flex-1"
-                  />
-                </div>
-                <div className="flex min-h-0 min-w-0 flex-1 flex-col lg:col-start-2 lg:row-span-2 lg:row-start-1 lg:min-h-0">
-                  <TrendRadarChart
-                    reduceMotion={reduceMotion}
-                    polar={trendPolarData}
-                    activeTrendName={activeTrendHighlight}
-                    speechPulse={speechPulse}
-                    voice={{
-                      audioAnalyzerRef,
-                      isPlayingTTS,
-                      progressNorm: radarVoiceBonding.progressNorm,
-                      dimOthersWhenSpeaking:
-                        isPlayingTTS && Boolean(activeTrendHighlight?.trim()),
-                    }}
-                    bondingHud={
-                      <>
-                        {!radarVoiceBonding.bondingHasData &&
-                        latestMcSol === null ? (
-                          <span className="block text-cyan-400/90 leading-tight">
-                            Connect a token
-                          </span>
-                        ) : null}
-                        {radarVoiceBonding.bondingHasData &&
-                        radarVoiceBonding.progress !== null &&
-                        radarVoiceBonding.progress < 100 &&
-                        bondingCurveData?.realTokenReserves != null ? (
-                          <span className="block font-mono text-fuchsia-200/90 leading-tight">
-                            Pending{" "}
-                            {(() => {
-                              const currentTokens = BigInt(
-                                bondingCurveData.realTokenReserves,
-                              );
-                              const initialTokens = BigInt("793100000000000");
-                              return `${(Number((currentTokens * BigInt("10000")) / initialTokens) / 100).toFixed(1)}%`;
-                            })()}
-                          </span>
-                        ) : null}
-                      </>
-                    }
-                  />
-                </div>
+              <div className="flex flex-col flex-1 min-h-0">
+                <NeuralNetCanvas
+                  trends={dedupedRef.current}
+                  memecoins={memecoinIdeas}
+                  activeTrendName={activeTrendHighlight}
+                  isProcessing={isAgentProcessing}
+                  speechPulse={speechPulse}
+                  isPlayingTTS={isPlayingTTS}
+                  audioAnalyzerRef={audioAnalyzerRef}
+                  variant={isStreamLayout ? "stream" : "default"}
+                  className="flex-1 min-h-0"
+                  launchPhase={launchState.phase}
+                  launchSelectedId={launchState.selectedIdea?.id ?? null}
+                  launchCountdownSec={launchState.countdownSec}
+                />
+                <LaunchResultOverlay
+                  visible={launchState.phase === "success"}
+                  idea={launchState.selectedIdea}
+                  mint={launchState.deployResult?.mint ?? null}
+                  signature={launchState.deployResult?.signature ?? null}
+                  onDismiss={() => setLaunchState(INITIAL_LAUNCH_STATE)}
+                />
+                <MemecoinTicker
+                  memecoins={memecoinIdeas}
+                  className="shrink-0"
+                  launchPhase={launchState.phase}
+                  launchSelectedId={launchState.selectedIdea?.id ?? null}
+                  launchCountdownSec={launchState.countdownSec}
+                  launchMint={launchState.deployResult?.mint ?? null}
+                />
               </div>
-              )}
               {trendsError && (
                 <p className="mt-1 shrink-0 px-1 text-[10px] text-red-400/90">
                   {trendsError}

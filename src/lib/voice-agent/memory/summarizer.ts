@@ -4,24 +4,11 @@
  */
 
 import type { MemoryTurn } from "@/lib/voice-agent/types";
-
-const QWEN_BASE_URL = () => process.env.QWEN_BASE_URL || "https://server.songjam.space";
-const QWEN_MODEL = () => process.env.QWEN_MODEL || "qwen2.5:3b";
+import { qwenChat } from "@/lib/qwen-client";
 
 async function callQwen(prompt: string): Promise<string> {
   try {
-    const res = await fetch(`${QWEN_BASE_URL()}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: QWEN_MODEL(),
-        messages: [{ role: "user", content: prompt }],
-        stream: false,
-      }),
-    });
-    if (!res.ok) return "";
-    const data = (await res.json()) as { message?: { content?: string } };
-    return data.message?.content?.trim() || "";
+    return await qwenChat([{ role: "user", content: prompt }]);
   } catch {
     return "";
   }

@@ -48,6 +48,8 @@ export type DedupedTrend = {
   cluster_id?: number;
   /** Thumbnail image for the trend (from source). */
   image_url?: string | null;
+  /** Tweet IDs from source — preserved for future tweet content fetching. */
+  top_tweet_ids?: string[];
 };
 
 /** Normalize for comparing radar trend labels (case, whitespace). */
@@ -102,6 +104,13 @@ export function dedupeTrendsByName(rows: LiveTrendRow[]): DedupedTrend[] {
         ? rawCluster
         : undefined;
     const image_url = (hottest?.image_url || latest.image_url) ?? null;
+    // Merge top_tweet_ids from all rows in the group (union, deduplicated)
+    const tweetIdSet = new Set<string>();
+    for (const r of group) {
+      for (const id of r.top_tweet_ids ?? []) {
+        if (id) tweetIdSet.add(id);
+      }
+    }
     out.push({
       trend_name: name,
       summary: bestSummary || (latest.summary || "").slice(0, 280),
@@ -112,6 +121,7 @@ export function dedupeTrendsByName(rows: LiveTrendRow[]): DedupedTrend[] {
       tweet_count: tc || undefined,
       cluster_id,
       image_url: image_url || undefined,
+      top_tweet_ids: tweetIdSet.size > 0 ? [...tweetIdSet] : undefined,
     });
   }
   return out.sort((a, b) => b.maxHeat - a.maxHeat);
